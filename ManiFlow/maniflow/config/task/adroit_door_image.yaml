@@ -19,7 +19,7 @@ shape_meta: &shape_meta
     horizon: 16
 
 env_runner:
-  _target_: maniflow.env_runner.adroit_runner.AdroitRunner
+  _target_: maniflow.env_runner.adroit_runner_2d.AdroitRunner2D
   eval_episodes: 20
   max_steps: 300
   n_obs_steps: ${n_obs_steps}
@@ -36,6 +36,7 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
   val_ratio: 0.02
-  max_train_episodes: 90
+  max_train_episodes: null
   use_img: true
   use_depth: false
+  use_full_state: true

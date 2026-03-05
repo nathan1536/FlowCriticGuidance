@@ -1,0 +1,173 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:24.08-py3
+
+%labels
+    Author ManiFlow Team
+    Version 1.0
+    Description ManiFlow environment container for 2D MetaWorld training (code not included)
+
+%environment
+    # MuJoCo environment
+    export MUJOCO_GL=egl
+    export MUJOCO_PY_MUJOCO_PATH=/opt/mujoco/mujoco210
+    export LD_LIBRARY_PATH=/opt/mujoco/mujoco210/bin:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+    
+    # NVIDIA EGL/Vulkan
+    export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
+    export VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
+    
+    # Misc
+    export TOKENIZERS_PARALLELISM=false
+    export HYDRA_FULL_ERROR=1
+
+%files
+    scripts/requirements-cluster.txt /opt/requirements-cluster.txt
+    # Include local mujoco-py source (patched builder.py forces EGL/GPU rendering)
+    third_party/mujoco-py-2.1.2.14 /opt/mujoco-py
+
+%post
+    # Update system packages
+    apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        wget \
+        unzip \
+        vim \
+        libgl1-mesa-dev \
+        libgl1-mesa-glx \
+        libglew-dev \
+        libosmesa6-dev \
+        libglfw3-dev \
+        libglfw3 \
+        patchelf \
+        xvfb \
+        xserver-xorg-dev \
+        libxrandr2 \
+        libxinerama1 \
+        libxcursor1 \
+        libxi6 \
+        libegl1 \
+        libgles2 \
+        libegl-mesa0 \
+        libgbm1 \
+        libvulkan1 \
+        vulkan-tools \
+        mesa-vulkan-drivers \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Create directories
+    mkdir -p /opt/mujoco
+    mkdir -p /usr/share/glvnd/egl_vendor.d
+    mkdir -p /etc/vulkan/icd.d
+    mkdir -p /workspace
+
+    # Download and install MuJoCo 2.1.0
+    wget -q https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O /tmp/mujoco.tar.gz \
+        && tar -xzf /tmp/mujoco.tar.gz -C /opt/mujoco \
+        && rm /tmp/mujoco.tar.gz
+    
+    # Set up MuJoCo paths for build
+    export MUJOCO_PY_MUJOCO_PATH=/opt/mujoco/mujoco210
+    export LD_LIBRARY_PATH=/opt/mujoco/mujoco210/bin:$LD_LIBRARY_PATH
+
+    # Create EGL vendor file for NVIDIA
+    cat > /usr/share/glvnd/egl_vendor.d/10_nvidia.json << 'EOF'
+{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "libEGL_nvidia.so.0"
+    }
+}
+EOF
+
+    # Create Vulkan ICD file for NVIDIA
+    cat > /etc/vulkan/icd.d/nvidia_icd.json << 'EOF'
+{
+    "file_format_version" : "1.0.0",
+    "ICD": {
+        "library_path": "libGLX_nvidia.so.0",
+        "api_version" : "1.3.0"
+    }
+}
+EOF
+
+    # Upgrade pip
+    pip install --upgrade pip setuptools wheel
+
+    # Install Python dependencies from requirements file first
+    pip install --no-cache-dir -r /opt/requirements-cluster.txt
+
+    # Install mujoco-py from local source (patched builder.py forces EGL/GPU even without nvidia-smi)
+    pip install --no-cache-dir Cython==0.29.35
+    cd /opt/mujoco-py && pip install --no-cache-dir -e .
+
+    # Pre-compile mujoco-py and make generated dir writable for runtime
+    python -c "import mujoco_py" || true
+    chmod -R 777 /opt/mujoco-py/mujoco_py/generated || true
+    # pytorch3d dependencies
+    pip install --no-cache-dir fvcore iopath
+
+    # Build pytorch3d from source for A5000 (Ampere, compute capability 8.6)
+    export FORCE_CUDA=1
+    export TORCH_CUDA_ARCH_LIST="8.6"
+    pip install --no-cache-dir --no-build-isolation\
+        "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
+
+
+    pip install --no-cache-dir --force-reinstall numpy==1.26.4
+    
+    # Clean up
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+%runscript
+    exec "$@"
+
+%test
+    # Basic tests to verify installation
+    python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+    python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+    # Note: mujoco-py test skipped - requires writable filesystem for lock file
+    # It will work at runtime with --writable-tmpfs or bind mounts
+    python -c "import mujoco; print('mujoco imported successfully')"
+    echo "Environment container ready! Mount your code at /workspace"
+
+%help
+    ManiFlow Environment Container (Code Not Included)
+    ===================================================
+    
+    This container includes:
+    - PyTorch 2.4.1 with CUDA 12.x support
+    - MuJoCo 2.1.0 with EGL rendering
+    - mujoco-py 2.1.2.14
+    - All Python dependencies for ManiFlow 2D training
+    
+    NOTE: Code is NOT included. You must bind-mount your project.
+    Required third-party packages (installed at runtime):
+    - gym-0.21.0, Metaworld, r3m, ManiFlow
+    
+    Usage:
+    ------
+    # Interactive shell with code mounted
+    apptainer shell --nv \
+        --bind /path/to/ManiFlow_Policy:/workspace \
+        maniflow.sif
+    
+    # Run training (see task.sh for full example)
+    apptainer exec --nv \
+        --bind /path/to/ManiFlow_Policy:/workspace \
+        --env PYTHONPATH="/workspace/ManiFlow:/workspace/third_party/gym-0.21.0:/workspace/third_party/Metaworld:/workspace/third_party/r3m" \
+        --pwd /workspace \
+        maniflow.sif bash scripts/train_eval_metaworld_2d.sh <args>
+    
+    Build:
+    ------
+    sudo apptainer build maniflow.sif Apptainer.def
+    
+    Upload to cluster:
+    ------------------
+    scp maniflow.sif username@vmknoll81.in.tum.de:~/
+    rsync -avz --exclude='*.sif' --exclude='wandb/' --exclude='*.ckpt' \
+        ManiFlow_Policy/ username@vmknoll81.in.tum.de:~/ManiFlow_Policy/

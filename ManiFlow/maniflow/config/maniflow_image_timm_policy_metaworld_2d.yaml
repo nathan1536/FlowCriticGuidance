@@ -1,0 +1,186 @@
+defaults:
+  - task: metaworld_multitask_2d
+
+name: train_maniflow_image_timm_policy_metaworld_2d
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "critic_guided_acgd_v2"
+
+# Keep these aligned with your MetaWorld runners/datasets
+horizon: 4
+n_obs_steps: 2
+n_action_steps: 3
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTX"
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  visual_cond_len: 256
+  max_lang_cond_len: 1024
+  qkv_bias: false
+  qk_norm: false
+
+  language_conditioned: true
+  pre_norm_modality: false
+
+  flow_batch_ratio: 0.75
+  consistency_batch_ratio: 0.25
+
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete"
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    # You can swap to e.g. 'resnet34.a1_in1k' or 'vit_base_patch16_clip_224.openai'
+    model_name: 'r3m'
+    pretrained: False
+    frozen: False
+    global_pool: ''
+    feature_aggregation: null
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees: [-5.0, 5.0]
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 256
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  distributed: False
+  device: "cuda:0"
+  env_device: "cuda:0"
+  num_gpus: 1  
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 2001
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 20
+  checkpoint_every: 20
+  val_every: 50
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: ManiFlow
+  resume: False
+  tags:
+    - ${logging.project}
+    - metaworld
+    - image_2d
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 3
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+# Critic-guided training configuration
+# Two modes available:
+# 1. AWR (acgd_enabled: False): Weight expert demos by Q-value
+# 2. ACGD (acgd_enabled: True): Maximize Q of student's predicted actions
+critic_guided:
+  enabled: True
+  critic_dir: "/home/nathan4074/Project/ManiFlow_Policy/runs/sb3_metaworld_sac/models"
+  state_dim: 39
+  action_dim: 4
+  hidden_dim: 128
+  
+  # ACGD mode: L = α * L_BC - λ * Q(s, π_θ(s,o,t))
+  # Directly maximizes Q-value of student's predicted actions
+  acgd_enabled: True      # True = ACGD mode, False = AWR mode
+  acgd_sample_steps: 4         # Euler steps for student action sampling
+  acgd_alpha: 1.0              # Weight for BC (flow matching) loss
+  acgd_lambda: 0.2        # Weight for Q-maximization (distillation) loss
+  acgd_warmup_epochs: 0       # Disable ACGD until epoch N (let BC pretrain first)
+  
+  # AWR mode parameters (only used when acgd_enabled: False)
+  temperature: 0.5  # Lower = more selective
+  weight_min: 0.1   # Minimum sample weight
+  weight_max: 4.0   # Maximum sample weight
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

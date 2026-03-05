@@ -1,0 +1,85 @@
+from typing import List
+import numpy as np
+import tqdm
+
+from maniflow.env_runner.base_runner import BaseRunner
+from maniflow.env_runner.metaworld_runner_2d import MetaworldRunner2D
+from maniflow.policy.base_policy import BasePolicy
+
+
+class MetaworldMultitaskRunner2D(BaseRunner):
+    """
+    2D version of `MetaworldMultitaskRunner`:
+    - uses `MetaworldRunner2D` for each task (RGB + agent_pos, no point cloud).
+    """
+
+    def __init__(
+        self,
+        output_dir,
+        task_names: List[str],
+        eval_episodes=20,
+        max_steps=1000,
+        n_obs_steps=8,
+        n_action_steps=8,
+        fps=10,
+        crf=22,
+        render_size=84,
+        tqdm_interval_sec=5.0,
+        n_envs=None,
+        n_train=None,
+        n_test=None,
+        device="cuda:0",
+        image_size: int = 128,
+        camera_name: str = "corner2",
+        **kwargs,
+    ):
+        super().__init__(output_dir)
+
+        self.task_names = task_names
+        self.runners = {}
+
+        for task_name in task_names:
+            self.runners[task_name] = MetaworldRunner2D(
+                output_dir=output_dir,
+                eval_episodes=eval_episodes,
+                max_steps=max_steps,
+                n_obs_steps=n_obs_steps,
+                n_action_steps=n_action_steps,
+                fps=fps,
+                crf=crf,
+                render_size=render_size,
+                n_envs=n_envs,
+                n_train=n_train,
+                n_test=n_test,
+                tqdm_interval_sec=tqdm_interval_sec,
+                task_name=task_name,
+                device=device,
+                image_size=image_size,
+                camera_name=camera_name,
+            )
+
+        self.eval_episodes = eval_episodes
+        self.tqdm_interval_sec = tqdm_interval_sec
+
+    def run(self, policy: BasePolicy, save_video=True):
+        results = {}
+        avg_success_rate = 0.0
+
+        for task_name in tqdm.tqdm(
+            self.task_names,
+            desc="Evaluating tasks (2D)",
+            leave=False,
+            mininterval=self.tqdm_interval_sec,
+        ):
+            runner = self.runners[task_name]
+            task_results = runner.run(policy, save_video)
+            results[task_name] = task_results
+
+            success_rate = np.mean(task_results.get("mean_success_rates", 0.0))
+            avg_success_rate += float(success_rate)
+
+        avg_success_rate /= max(1, len(self.task_names))
+        results["average_success_rate"] = avg_success_rate
+        return results
+
+

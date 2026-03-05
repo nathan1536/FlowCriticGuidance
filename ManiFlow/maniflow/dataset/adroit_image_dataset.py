@@ -2,6 +2,7 @@ from typing import Dict
 import torch
 import numpy as np
 import copy
+import zarr
 from maniflow.common.pytorch_util import dict_apply
 from maniflow.common.replay_buffer import ReplayBuffer
 from maniflow.common.sampler import (SequenceSampler, get_val_mask, downsample_mask)
@@ -21,12 +22,14 @@ class AdroitImageDataset(BaseDataset):
             task_name=None,
             use_img=True,
             use_depth=False,
+            use_full_state=True,
             ):
         super().__init__()
         cprint(f'Loading AdroitImageDataset from {zarr_path}', 'green')
         self.task_name = task_name
         self.use_img = use_img
         self.use_depth = use_depth
+        self.use_full_state = use_full_state
 
 
         buffer_keys = [
@@ -37,6 +40,19 @@ class AdroitImageDataset(BaseDataset):
             buffer_keys.append('img')
         if self.use_depth:
             buffer_keys.append('depth')
+        if self.use_full_state:
+            buffer_keys.append('full_state')
+
+        self.has_v_value = False
+        if self.use_full_state:
+            try:
+                _zr = zarr.open(zarr_path, mode='r')
+                if 'v_value' in _zr['data']:
+                    buffer_keys.append('v_value')
+                    self.has_v_value = True
+                    cprint('  Found v_value in zarr -> loading for advantage weighting', 'cyan')
+            except Exception:
+                pass
 
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path, keys=buffer_keys)
@@ -87,6 +103,10 @@ class AdroitImageDataset(BaseDataset):
             normalizer['depth'] = SingleFieldLinearNormalizer.create_identity()
         
         normalizer['agent_pos'] = SingleFieldLinearNormalizer.create_identity()
+        if self.use_full_state:
+            normalizer['full_state'] = SingleFieldLinearNormalizer.create_identity()
+        if self.has_v_value:
+            normalizer['v_value'] = SingleFieldLinearNormalizer.create_identity()
         
         return normalizer
 
@@ -110,6 +130,10 @@ class AdroitImageDataset(BaseDataset):
             data['obs']['image'] = image
         if self.use_depth:
             data['obs']['depth'] = depth
+        if self.use_full_state:
+            data['obs']['full_state'] = sample['full_state'][:,].astype(np.float32)
+        if self.has_v_value:
+            data['obs']['v_value'] = sample['v_value'][:,].astype(np.float32)
             
         return data
     

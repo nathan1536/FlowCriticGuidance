@@ -306,17 +306,11 @@ class AdroitEnv:
             shape=(self.act_dim,),
             dtype=np.float64
         )
-        self.observation_space = spaces.Dict({
+        obs_spaces = {
             'image': spaces.Box(
                 low=0,
                 high=1,
                 shape=(number_channel, 84, 84),
-                dtype=np.float32
-            ),
-            'depth': spaces.Box(
-                low=0,
-                high=1,
-                shape=(84, 84),
                 dtype=np.float32
             ),
             'agent_pos': spaces.Box(
@@ -325,7 +319,14 @@ class AdroitEnv:
                 shape=(self.obs_sensor_dim,),
                 dtype=np.float32
             ),
-        })
+        }
+
+        if use_point_cloud:
+            obs_spaces['depth'] = spaces.Box(
+                low=0, high=1, shape=(84, 84), dtype=np.float32
+            )
+
+        self.observation_space = spaces.Dict(obs_spaces)
 
         if use_point_cloud:
             self.observation_space['point_cloud'] = spaces.Box(

@@ -26,7 +26,7 @@ policy:
   qkv_bias: true
   qk_norm: true
 
-  language_conditioned: false
+  language_conditioned: True
   pre_norm_modality: false
 
   flow_batch_ratio: 0.75 

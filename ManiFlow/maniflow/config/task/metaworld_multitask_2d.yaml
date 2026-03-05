@@ -1,0 +1,54 @@
+name: metaworld_multitask_2d
+
+task_names:
+  - assembly
+  # - reach
+  # - reach-wall
+  # - window-open
+
+# 2D shape meta: image + agent_pos
+shape_meta: &shape_meta
+  obs:
+    image:
+      # Your Zarr can be (T,H,W,C) or (T,C,H,W). Encoders handle both.
+      # This is the "target" shape expected by the policy/encoder.
+      shape: [3, 128, 128]
+      type: rgb
+      horizon: ${n_obs_steps}
+    agent_pos:
+      shape: [9]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [4]
+
+env_runner:
+  _target_: maniflow.env_runner.metaworld_multitask_runner_2d.MetaworldMultitaskRunner2D
+  eval_episodes: 20
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  n_envs: null
+  n_train: null
+  n_test: null
+  task_names: ${task.task_names}
+  device: ${training.env_device}
+  image_size: 128
+  camera_name: corner2
+
+dataset:
+  _target_: maniflow.dataset.metaworld_multitask_image_dataset.MetaworldMultitaskImageDataset
+  data_path: data/
+  task_names: ${task.task_names}
+  # By default this class looks for: data/metaworld_{task_name}_expert.zarr
+  # Override if your RGB rollouts have a different naming scheme:
+  # zarr_name_template: "metaworld_{task_name}_ppo_rgb_success.zarr"
+  zarr_name_template: "metaworld_{task_name}_expert.zarr"
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 10000
+
+

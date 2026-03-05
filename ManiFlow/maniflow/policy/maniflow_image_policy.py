@@ -442,7 +442,238 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         return traj
 
-    def compute_loss(self, batch, ema_model=None, **kwargs):
+    def few_step_sample_for_training(self, noise, vis_cond, lang_cond=None, num_steps=4):
+        """
+        Run few Euler steps with FULL gradient flow via gradient checkpointing.
+        Memory cost ≈ same as no_grad version (recomputes forward during backward).
+        """
+        x = noise
+        dt = 1.0 / num_steps
+        batch_size = x.shape[0]
+        
+        for i in range(num_steps):
+            t = torch.ones(batch_size, device=self.device) * (i / num_steps)
+            if self.sample_target_t_mode == "absolute":
+                target_t = t + dt
+            elif self.sample_target_t_mode == "relative":
+                target_t = torch.ones(batch_size, device=self.device) * dt
+            
+            # Wrap each Euler step in gradient checkpointing:
+            # - Forward: runs normally, but intermediate activations are NOT stored
+            # - Backward: recomputes the forward pass to get activations, then computes grads
+            x = torch.utils.checkpoint.checkpoint(
+                self._euler_step, x, t, target_t, vis_cond, lang_cond, dt,
+                use_reentrant=False
+            )
+        
+        return x
+
+    def _euler_step(self, x, t, target_t, vis_cond, lang_cond, dt):
+        """Single Euler step (factored out for checkpointing)."""
+        v = self.model(x, t, target_t=target_t, vis_cond=vis_cond, lang_cond=lang_cond)
+        return x + v * dt
+
+    def compute_acgd_loss(
+            self,
+            batch,
+            vis_cond,
+            lang_cond,
+            critics: dict,
+            num_steps: int = 4,
+            chunked_critic: bool = False,
+    ):
+        """
+        Compute ACGD distillation loss: -Q(s, π_θ(s,o,t))
+        Optimized with vectorization over time and task batching.
+
+        When chunked_critic=True, critics expect Q(s_t, [a_t, a_{t+1}, ..., a_{t+k-1}])
+        instead of single-step Q(s_t, a_t).
+        """
+        batch_size = vis_cond.shape[0]
+        device = self.device
+
+        # 1. Sample noise and generate student actions (same as before)
+        noise = torch.randn(
+            batch_size, self.horizon, self.action_dim,
+            device=device, dtype=vis_cond.dtype
+        )
+
+        student_action_norm = self.few_step_sample_for_training(
+            noise, vis_cond, lang_cond, num_steps=num_steps
+        )
+
+        student_action_raw = self.normalizer['action'].unnormalize(student_action_norm)
+        student_action_raw = student_action_raw.clamp(-1.0, 1.0)
+        student_action_raw = student_action_raw.to(device)
+
+        # 2. Prepare data slices (Vectorized slicing)
+        # Use the timestep that will actually be executed at inference
+        exec_start = self.n_obs_steps - 1
+        exec_end = exec_start + self.n_action_steps
+
+
+        limit = batch['obs']['full_state'].shape[1]
+        actual_end = min(exec_end, limit)
+
+        relevant_states = batch['obs']['full_state'][:, exec_start:actual_end].to(device)
+        relevant_student_actions = student_action_raw[:, exec_start:actual_end]
+        relevant_expert_actions = batch['action'][:, exec_start:actual_end].to(device)
+
+        task_names = batch['obs']['task_name']
+
+        # 3. Group by Task to batch critic calls
+        # We process unique tasks one by one, but batch all samples for that task
+        unique_tasks = set(task_names)
+
+        per_task_losses = []
+        all_q_student = []
+        all_q_expert = []
+
+        for task_name in unique_tasks:
+            critic = critics.get(task_name)
+            if critic is None:
+                continue
+
+            # Find all batch indices belonging to this task
+            task_indices = [i for i, t in enumerate(task_names) if t == task_name]
+            task_indices_tensor = torch.tensor(task_indices, device=device)
+
+            # Gather data for this task: (B_task, T_slice, Dim)
+            task_states = relevant_states[task_indices_tensor]
+            task_stud_acts = relevant_student_actions[task_indices_tensor]
+            task_exp_acts = relevant_expert_actions[task_indices_tensor]
+
+            if chunked_critic:
+                # Chunked critic: Q(s_t, [a_t, a_{t+1}, ..., a_{t+k-1}])
+                # Take first state, flatten action chunk
+                sa_student = torch.cat([task_states[:, 0], task_stud_acts.reshape(task_stud_acts.shape[0], -1)], dim=-1)
+                sa_expert = torch.cat([task_states[:, 0], task_exp_acts.reshape(task_exp_acts.shape[0], -1)], dim=-1)
+            else:
+                # Single-step critic: Q(s_t, a_t) — original path
+                sa_student = torch.cat([task_states, task_stud_acts], dim=-1)
+                sa_expert = torch.cat([task_states, task_exp_acts], dim=-1)
+            
+            # # Prepare inputs
+            # sa_student = torch.cat([flat_states, flat_stud_acts], dim=-1)
+            # sa_expert = torch.cat([flat_states, flat_exp_acts], dim=-1)
+            
+            # 4. Batched Critic Evaluation
+            # Student Q (keep gradients)
+            q_student_per_sample = critic(sa_student).mean(-1)
+
+            # Expert Q (no gradients, for logging only)
+            with torch.no_grad():
+                q_expert_per_sample = critic(sa_expert).mean(-1)
+
+            # 5. Compute Stats & Normalization
+            #   α = η / E|Q|,  L_q = -α · E[Q(s, a_student)]
+            # Scale-invariant across tasks and training stages.
+            # η is hvia acgd_lambda in the outer loss.
+            q_abs_mean = q_student_per_sample.detach().abs().mean().clamp(min=1.0)
+            task_loss = -q_student_per_sample.mean() / q_abs_mean
+
+            # # --- Previous
+            # expert_mean = q_expert_per_sample.mean()
+            # expert_std = q_expert_per_sample.std(unbiased=False)
+            # expert_std = torch.clamp(expert_std, min=1.0)
+            #
+            # per_sample_gap = (q_expert_per_sample.detach() - q_student_per_sample) / expert_std
+            # task_loss = F.softplus(per_sample_gap, beta=2.0).mean()
+            # # --- End 
+
+            per_task_losses.append(task_loss)
+            all_q_student.append(q_student_per_sample.mean().detach())
+            all_q_expert.append(q_expert_per_sample.mean().detach())
+
+            # 6. Final Aggregation
+            if len(per_task_losses) > 0:
+                loss_distill = torch.stack(per_task_losses).mean()
+                q_student_mean = torch.stack(all_q_student).mean()
+                q_expert_mean = torch.stack(all_q_expert).mean()
+            else:
+                loss_distill = torch.tensor(0.0, device=device, requires_grad=True)
+                q_student_mean = torch.tensor(0.0, device=device)
+                q_expert_mean = torch.tensor(0.0, device=device)
+
+            q_gap = q_expert_mean - q_student_mean
+
+        return loss_distill, q_student_mean, q_expert_mean, q_gap
+
+    def compute_critic_weights(
+        self,
+        batch,
+        critics: dict,
+        temperature: float = 1.0,
+        weight_min: float = 0.01,
+        weight_max: float = 5.0,
+        chunked_critic: bool = False,
+        chunk_size: int = 3,
+    ):
+        """
+        Compute advantage weights using per-task Q-critics.
+
+        If pre-computed V(s) is available in batch['obs']['v_value'],
+        uses proper advantage: A(s,a) = Q(s,a) - V(s).
+        Otherwise falls back to batch-normalized Q.
+
+        When chunked_critic=True, evaluates Q(s_0, [a_0, ..., a_{k-1}]).
+        """
+        state_for_critic = batch['obs']['full_state']  # (B, T, state_dim)
+        actions = batch['action']               # (B, T, action_dim)
+        task_names = batch['obs']['task_name']  # list of B task names
+        has_v = 'v_value' in batch['obs']
+
+        batch_size = actions.shape[0]
+        device = actions.device
+
+        # Build critic input
+        states_0 = state_for_critic[:, 0].to(device)   # (B, state_dim)
+        if chunked_critic:
+            # Flatten first chunk_size actions: (B, chunk_size * action_dim)
+            action_chunk = actions[:, :chunk_size].reshape(batch_size, -1).to(device)
+            sa_all = torch.cat([states_0, action_chunk], dim=-1)
+        else:
+            actions_0 = actions[:, 0].to(device)            # (B, action_dim)
+            sa_all = torch.cat([states_0, actions_0], dim=-1)  # (B, state_dim+action_dim)
+
+        q_values = torch.zeros(batch_size, device=device)
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            unique_tasks = set(task_names)
+            for task_name in unique_tasks:
+                critic = critics.get(task_name)
+                if critic is None:
+                    continue
+                task_idx = [i for i, t in enumerate(task_names) if t == task_name]
+                idx_t = torch.tensor(task_idx, device=device)
+                q_batch = critic(sa_all[idx_t]).squeeze(-1)
+                q_values[idx_t] = q_batch
+                valid_mask[idx_t] = True
+
+        if not valid_mask.any():
+            neutral = torch.ones(batch_size, device=device)
+            return neutral, None, None
+
+        # Fill invalid entries with mean of valid Q
+        if not valid_mask.all():
+            q_values[~valid_mask] = q_values[valid_mask].mean()
+
+        # Compute advantage
+        if has_v:
+            v_values = batch['obs']['v_value'][:, 0].to(device)  # (B,)
+            advantage = q_values - v_values
+            # Normalize by advantage std for stable weighting
+            adv_std = advantage.std().clamp(min=1e-4)
+            advantage = advantage / adv_std
+        else:
+            advantage = (q_values - q_values.mean()) / (q_values.std() + 1e-8)
+
+        weights = torch.exp(advantage / temperature).clamp(min=weight_min, max=weight_max)
+
+        return weights, q_values, advantage
+
+    def compute_loss(self, batch, ema_model=None, critics=None, critic_cfg=None, **kwargs):
         # normalize input
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action']).to(self.device)
@@ -469,10 +700,42 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         nobs_features = self.obs_encoder(this_nobs)
         vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
         
-        """Get flow and consistency targets"""
-        flow_batchsize = int(batch_size * self.flow_batch_ratio)
-        consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
-    
+        # Parse critic config FIRST (needed for batch split decision)
+        use_critics = critics is not None and len(critics) > 0
+        use_acgd = critic_cfg.get("acgd_enabled", False) if critic_cfg else False
+        use_awr = use_critics and not use_acgd  # AWR only if ACGD is disabled
+        
+        # Determine ACGD warmup state early (needed for batch split)
+        acgd_active = False
+        if use_acgd and use_critics:
+            acgd_warmup_epochs = critic_cfg.get("acgd_warmup_epochs", 0)
+            current_epoch = kwargs.get("epoch", 0)
+            acgd_active = current_epoch >= acgd_warmup_epochs
+        
+        # Set batch split: disable consistency when ACGD is active
+        if use_acgd and acgd_active:
+            # Disable consistency loss — the model already has few-step capability
+            # from warmup training. Keeping it on fights the ACGD gradient.
+            flow_batchsize = batch_size
+            consistency_batchsize = 0
+        else:
+            flow_batchsize = int(batch_size * self.flow_batch_ratio)
+            consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
+
+        # AWR: Compute critic-based advantage weights if using AWR mode
+        weights = None
+        q_values_for_logging = None
+        advantage_for_logging = None
+        if use_awr:
+            temperature = critic_cfg.get("temperature", 1.0) if critic_cfg else 1.0
+            weight_min = critic_cfg.get("weight_min", 0.01) if critic_cfg else 0.01
+            weight_max = critic_cfg.get("weight_max", 5.0) if critic_cfg else 5.0
+            is_chunked = critic_cfg.get("chunked_critic", False)
+            c_size = critic_cfg.get("chunk_size", 3)
+            weights, q_values_for_logging, advantage_for_logging = self.compute_critic_weights(
+                batch, critics, temperature, weight_min, weight_max,
+                chunked_critic=is_chunked, chunk_size=c_size,
+            )
 
         # Get flow targets
         flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
@@ -486,46 +749,118 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
-        # Get consistency targets
-        consistency_target_dict = self.get_consistency_velocity(nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-                                                                        ema_model=ema_model
-                                                                        )
-        v_ct_pred = self.model(
-            sample=consistency_target_dict['x_t'], 
-            timestep=consistency_target_dict['t'].squeeze(),
-            target_t=consistency_target_dict['target_t'].squeeze(),
-            vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+        # Get consistency targets (SKIP when consistency is disabled)
+        v_ct_pred_magnitude = 0.0
+        loss_ct_scalar = 0.0
+        consistency_target_dict = None
+        
+        if consistency_batchsize > 0:
+            consistency_target_dict = self.get_consistency_velocity(
+                nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
+                vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
+                lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+                ema_model=ema_model
             )
-        v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
+            v_ct_pred = self.model(
+                sample=consistency_target_dict['x_t'], 
+                timestep=consistency_target_dict['t'].squeeze(),
+                target_t=consistency_target_dict['target_t'].squeeze(),
+                vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
+                lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+            )
+            v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
         """Compute losses"""
-        loss = 0.
+        loss_bc = 0.
 
         # compute flow loss 
         v_flow_target = flow_target_dict['v_target']
         loss_flow = F.mse_loss(v_flow_pred, v_flow_target, reduction='none')
-        loss_flow = reduce(loss_flow, 'b ... -> b (...)', 'mean')
-        loss += loss_flow.mean()
-        loss_flow = loss_flow.mean().item()
+        loss_flow = reduce(loss_flow, 'b ... -> b', 'mean')  # (flow_batchsize,) - fully reduced per sample
+        
+        # Apply AWR critic weights to flow loss (only in AWR mode)
+        if use_awr and weights is not None:
+            flow_weights = weights[:flow_batchsize]
+            weighted_loss_flow = (flow_weights * loss_flow).sum() / flow_weights.sum()
+            loss_bc += weighted_loss_flow
+            loss_flow_scalar = weighted_loss_flow.item()
+        else:
+            loss_bc += loss_flow.mean()
+            loss_flow_scalar = loss_flow.mean().item()
 
-        # compute consistency training loss
-        v_ct_target = consistency_target_dict['v_target']
-        loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
-        loss_ct = reduce(loss_ct, 'b ... -> b (...)', 'mean')
-        loss += loss_ct.mean()
-        loss_ct = loss_ct.mean().item()  
+        # compute consistency training loss (SKIP when consistency is disabled)
+        if consistency_batchsize > 0 and consistency_target_dict is not None:
+            v_ct_target = consistency_target_dict['v_target']
+            loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
+            loss_ct = reduce(loss_ct, 'b ... -> b', 'mean')
+            
+            # Apply AWR critic weights to consistency loss (only in AWR mode)
+            if use_awr and weights is not None:
+                ct_weights = weights[flow_batchsize:flow_batchsize+consistency_batchsize]
+                weighted_loss_ct = (ct_weights * loss_ct).sum() / ct_weights.sum()
+                loss_bc += weighted_loss_ct
+                loss_ct_scalar = weighted_loss_ct.item()
+            else:
+                loss_bc += loss_ct.mean()
+                loss_ct_scalar = loss_ct.mean().item()
 
-        loss = loss.mean()
+        loss_bc = loss_bc.mean()
+        
+        # ACGD: Add distillation loss that maximizes Q of student's predicted actions
+        loss_distill = torch.tensor(0.0, device=self.device)
+        acgd_q_student = 0.0
+        acgd_q_expert = 0.0
+        acgd_q_gap = 0.0
+        
+        if use_acgd and use_critics and acgd_active:
+            acgd_alpha = critic_cfg.get("acgd_alpha", 1.0)
+            acgd_lambda = critic_cfg.get("acgd_lambda", 0.3)
+            acgd_sample_steps = critic_cfg.get("acgd_sample_steps", 4)
+            
+            # Compute ACGD distillation loss: -Q(s, π_θ(s,o,t))
+            is_chunked = critic_cfg.get("chunked_critic", False)
+            loss_distill, acgd_q_student, acgd_q_expert, acgd_q_gap = self.compute_acgd_loss(
+                batch, vis_cond, lang_cond, critics, num_steps=acgd_sample_steps,
+                chunked_critic=is_chunked,
+            )
+            
+            # Total loss: α * L_flow + λ * L_distill (no consistency when ACGD active)
+            loss = acgd_alpha * loss_bc + acgd_lambda * loss_distill
+        else:
+            loss = loss_bc
+        
         loss_dict = {
-                'loss_flow': loss_flow,
-                'loss_ct': loss_ct,
+                'loss_flow': loss_flow_scalar,
+                'loss_ct': loss_ct_scalar,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
-                'bc_loss': loss.item(),
+                'bc_loss': loss_bc.item(),
         }
         
+        # Log AWR weight stats (only in AWR mode)
+        if use_awr and weights is not None:
+            loss_dict['critic_weight_mean'] = weights.mean().item()
+            loss_dict['critic_weight_std'] = weights.std().item()
+            loss_dict['critic_weight_min'] = weights.min().item()
+            loss_dict['critic_weight_max'] = weights.max().item()
+            
+            # Log Q-value and advantage statistics
+            if q_values_for_logging is not None:
+                loss_dict['critic_q_mean'] = q_values_for_logging.mean().item()
+                loss_dict['critic_q_std'] = q_values_for_logging.std().item()
+            if advantage_for_logging is not None:
+                loss_dict['critic_advantage_mean'] = advantage_for_logging.mean().item()
+                loss_dict['critic_advantage_std'] = advantage_for_logging.std().item()
+        
+        # Log ACGD stats (only in ACGD mode)
+        if use_acgd and use_critics:
+            loss_dict['acgd_active'] = 1.0 if acgd_active else 0.0  # Whether ACGD is enabled (after warmup)
+            if acgd_active:
+                loss_dict['acgd_loss_distill'] = loss_distill.item()
+                loss_dict['acgd_q_student'] = acgd_q_student      # Q(s, student_action)
+                loss_dict['acgd_q_expert'] = acgd_q_expert        # Q(s, expert_action)
+                loss_dict['acgd_q_gap'] = acgd_q_gap              # expert - student (positive = critic prefers expert)
+                loss_dict['acgd_total_loss'] = loss.item()
+            
 
         return loss, loss_dict

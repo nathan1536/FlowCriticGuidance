@@ -26,7 +26,7 @@ import torch
 import dill
 from omegaconf import OmegaConf
 import pathlib
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler, Subset
 import copy
 import random
 import wandb
@@ -37,7 +37,10 @@ import shutil
 import time
 import threading
 from hydra.core.hydra_config import HydraConfig
-from maniflow.policy.maniflow_pointcloud_policy import ManiFlowTransformerPointcloudPolicy
+try:
+    from maniflow.policy.maniflow_pointcloud_policy import ManiFlowTransformerPointcloudPolicy
+except ImportError:
+    ManiFlowTransformerPointcloudPolicy = None
 from maniflow.dataset.base_dataset import BaseDataset
 from maniflow.env_runner.base_runner import BaseRunner
 from maniflow.common.checkpoint_util import TopKCheckpointManager
@@ -46,6 +49,59 @@ from maniflow.model.diffusion.ema_model import EMAModel
 from maniflow.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def build_qcritic(state_dim: int, action_dim: int, hidden_dim: int):
+    """Build a simple Q(s,a) critic network for advantage-weighted training."""
+    import torch.nn as nn
+    return nn.Sequential(
+        nn.Linear(state_dim + action_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, 1),
+    )
+
+
+class TwinQCritic(torch.nn.Module):
+    """Conservative twin-Q critic: returns min(Q1(s,a), Q2(s,a))."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int):
+        super().__init__()
+        self.q0 = build_qcritic(state_dim, action_dim, hidden_dim)
+        self.q1 = build_qcritic(state_dim, action_dim, hidden_dim)
+
+    def forward(self, sa: torch.Tensor) -> torch.Tensor:
+        return torch.min(self.q0(sa), self.q1(sa))
+
+
+def _build_chunked_q(state_dim, action_dim, chunk_size, hidden_dim):
+    input_dim = state_dim + chunk_size * action_dim
+    return torch.nn.Sequential(
+        torch.nn.Linear(input_dim, hidden_dim),
+        torch.nn.ReLU(),
+        torch.nn.Linear(hidden_dim, hidden_dim),
+        torch.nn.ReLU(),
+        torch.nn.Linear(hidden_dim, 1),
+    )
+
+
+class TwinChunkedQCritic(torch.nn.Module):
+    """Conservative twin-Q chunked critic: Q(s, a_t:t+k) -> min(Q0, Q1).
+    """
+
+    def __init__(self, state_dim: int, action_dim: int, chunk_size: int, hidden_dim: int):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.q0 = _build_chunked_q(state_dim, action_dim, chunk_size, hidden_dim)
+        self.q1 = _build_chunked_q(state_dim, action_dim, chunk_size, hidden_dim)
+        self.register_buffer("target_mean", torch.tensor(0.0))
+        self.register_buffer("target_std", torch.tensor(1.0))
+
+    def forward(self, sa_chunk: torch.Tensor) -> torch.Tensor:
+        q_norm = torch.min(self.q0(sa_chunk), self.q1(sa_chunk))
+        return q_norm * self.target_std + self.target_mean
+
 
 class TrainManiFlowDexWorkspace:
     include_keys = ['global_step', 'epoch']
@@ -81,6 +137,55 @@ class TrainManiFlowDexWorkspace:
         self.global_step = 0
         self.epoch = 0
 
+        # Load per-task Q-critics for critic-guided training (ACGD / AWR)
+        self.task_critics = {}
+        critic_cfg = cfg.get("critic_guided", {})
+        if critic_cfg.get("enabled", False):
+            device = torch.device(cfg.training.device)
+            critic_dir = pathlib.Path(critic_cfg.get("critic_dir", "runs/sb3_adroit_sac/models"))
+            state_dim = critic_cfg.get("state_dim", 39)
+            action_dim = critic_cfg.get("action_dim", 28)
+            hidden_dim = critic_cfg.get("hidden_dim", 256)
+            task_name = cfg.task.get("task_name", None)
+            if task_name is not None:
+                task_names = [task_name]
+            else:
+                task_names = cfg.task.get("task_names", [])
+            use_chunked = critic_cfg.get("chunked_critic", False)
+            chunk_size = critic_cfg.get("chunk_size", 3)
+            for tn in task_names:
+                chunked_path = critic_dir / tn / "chunked_twin_critic_q.pt"
+                twin_path = critic_dir / tn / "sac_twin_critic_q.pt"
+                single_path = critic_dir / tn / "best_expert_critic_q.pt"
+
+                if use_chunked and chunked_path.exists():
+                    critic = TwinChunkedQCritic(state_dim, action_dim, chunk_size, hidden_dim)
+                    critic.load_state_dict(torch.load(str(chunked_path), map_location=device))
+                    critic.eval().to(device)
+                    for param in critic.parameters():
+                        param.requires_grad = False
+                    self.task_critics[tn] = critic
+                    cprint(f"[Critic-Guided] Loaded chunked twin Q-critic (chunk={chunk_size}) for task: {tn}", "green")
+                elif twin_path.exists():
+                    critic = TwinQCritic(state_dim, action_dim, hidden_dim)
+                    critic.load_state_dict(torch.load(str(twin_path), map_location=device))
+                    critic.eval().to(device)
+                    for param in critic.parameters():
+                        param.requires_grad = False
+                    self.task_critics[tn] = critic
+                    cprint(f"[Critic-Guided] Loaded twin Q-critic for task: {tn}", "green")
+                elif single_path.exists():
+                    critic = build_qcritic(state_dim, action_dim, hidden_dim)
+                    critic.load_state_dict(torch.load(str(single_path), map_location=device))
+                    critic.eval().to(device)
+                    for param in critic.parameters():
+                        param.requires_grad = False
+                    self.task_critics[tn] = critic
+                    cprint(f"[Critic-Guided] Loaded single Q-critic for task: {tn}", "green")
+                else:
+                    cprint(f"[Critic-Guided] No Q-critic found for task: {tn} at {critic_dir / tn}", "yellow")
+            cprint(f"[Critic-Guided] Loaded {len(self.task_critics)} critics", "green")
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         
@@ -113,7 +218,29 @@ class TrainManiFlowDexWorkspace:
         dataset: BaseDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseDataset), print(f"dataset must be BaseDataset, got {type(dataset)}")
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+
+        # Optionally use a subset of demos with random sampling (for critic validation experiments)
+        num_demos = cfg.training.get("num_demos", None)
+        full_dataset_size = len(dataset)
+        if num_demos is not None and num_demos < full_dataset_size:
+            subset_indices = list(range(num_demos))
+            dataset = Subset(dataset, subset_indices)
+            cprint(f"Using subset of {num_demos} demos (out of {full_dataset_size} total)", 'yellow')
+
+        num_batches = cfg.training.get("num_batches", None)
+        if num_batches is not None:
+            # Tutor's style: one giant RandomSampler covering all epochs,
+            # iterate with next(iter(dataloader)) in the training loop.
+            total_samples = cfg.dataloader.batch_size * num_batches * cfg.training.num_epochs
+            sampler = RandomSampler(dataset, replacement=True, num_samples=total_samples)
+            dataloader_cfg = dict(cfg.dataloader)
+            dataloader_cfg.pop('shuffle', None)  # can't use shuffle with sampler
+            train_dataloader = DataLoader(dataset, sampler=sampler, **dataloader_cfg)
+            train_dataloader_iter = iter(train_dataloader)
+            cprint(f"Using RandomSampler: {num_batches} batches/epoch, {total_samples} total samples", 'yellow')
+        else:
+            train_dataloader = DataLoader(dataset, **cfg.dataloader)
+            train_dataloader_iter = None
         normalizer = dataset.get_normalizer()
 
         # print dataset info
@@ -200,9 +327,26 @@ class TrainManiFlowDexWorkspace:
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
-            with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
+
+            # If using RandomSampler (tutor's style): draw num_batches from the single iterator
+            if train_dataloader_iter is not None:
+                epoch_batches = []
+                for _ in range(num_batches):
+                    epoch_batches.append(next(train_dataloader_iter))
+                epoch_iter = enumerate(epoch_batches)
+            else:
+                epoch_iter = enumerate(train_dataloader)
+
+            # # --- Original: iterate over train_dataloader directly ---
+            # with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
+            #         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+            #     for batch_idx, batch in enumerate(tepoch):
+            # # --- End original ---
+
+            with tqdm.tqdm(epoch_iter, total=num_batches if train_dataloader_iter is not None else len(train_dataloader),
+                    desc=f"Training epoch {self.epoch}",
                     leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                for batch_idx, batch in enumerate(tepoch):
+                for batch_idx, batch in tepoch:
                     t1 = time.time()
                     # device transfer
                     batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
@@ -211,8 +355,20 @@ class TrainManiFlowDexWorkspace:
                 
                     # compute loss
                     t1_1 = time.time()
+                    # For single-task critic-guided training, inject task_name
+                    # into the batch so compute_acgd_loss can look up the critic.
+                    if len(self.task_critics) > 0:
+                        tn = cfg.task.get("task_name", None)
+                        if tn is not None:
+                            batch['obs']['task_name'] = [tn] * batch['action'].shape[0]
                     # Forward pass
-                    raw_loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
+                    critic_cfg = cfg.get("critic_guided", {}) if len(self.task_critics) > 0 else None
+                    raw_loss, loss_dict = self.model.compute_loss(
+                        batch, self.ema_model,
+                        critics=self.task_critics if len(self.task_critics) > 0 else None,
+                        critic_cfg=critic_cfg,
+                        epoch=self.epoch
+                    )
 
                     loss = raw_loss / cfg.training.gradient_accumulate_every
                     loss.backward()
@@ -221,6 +377,9 @@ class TrainManiFlowDexWorkspace:
 
                     # step optimizer
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        # clip grad norm
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=cfg.training.get("max_grad_norm", 1.0))
+                        ###
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
@@ -250,7 +409,8 @@ class TrainManiFlowDexWorkspace:
                         print(f" update ema time: {t1_4-t1_3:.3f}")
                         print(f" logging time: {t1_5-t1_4:.3f}")
 
-                    is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                    total_batches = num_batches if train_dataloader_iter is not None else len(train_dataloader)
+                    is_last_batch = (batch_idx == (total_batches - 1))
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
                         wandb_run.log(step_log, step=self.global_step)

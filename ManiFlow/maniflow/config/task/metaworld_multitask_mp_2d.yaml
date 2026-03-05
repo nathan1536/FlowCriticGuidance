@@ -1,0 +1,47 @@
+name: metaworld_multitask_mp_2d
+
+task_names:
+  - assembly
+  # - reach
+  # - reach-wall
+  # - window-open
+
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: [3, 128, 128]
+      type: rgb
+    agent_pos:
+      shape: [9]
+      type: low_dim
+  action:
+    shape: [4]
+
+env_runner:
+  _target_: maniflow.env_runner.metaworld_multitask_runner_mp_2d.MetaworldMultitaskRunner2D
+  eval_episodes: 20
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  n_envs: null
+  n_train: null
+  n_test: null
+  task_names: ${task.task_names}
+  device: ${training.env_device}
+  max_processes: 12
+  image_size: 128
+  camera_name: corner2
+
+dataset:
+  _target_: maniflow.dataset.metaworld_multitask_image_dataset.MetaworldMultitaskImageDataset
+  data_path: data/
+  task_names: ${task.task_names}
+  zarr_name_template: "metaworld_{task_name}_expert.zarr"
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 10000
+
+

@@ -138,7 +138,7 @@ checkpoint:
     # k: 0
     # format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
     mode: min
-    k: 1
+    k: 3
     format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
   save_last_ckpt: True # this only saves when save_ckpt is True
   save_last_snapshot: False

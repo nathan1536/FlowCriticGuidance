@@ -7,8 +7,8 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
-horizon: 4
-n_obs_steps: 2
+horizon: 3
+n_obs_steps: 1
 n_action_steps: 3
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
@@ -29,8 +29,8 @@ policy:
   language_conditioned: false
   pre_norm_modality: false
 
-  flow_batch_ratio: 0.75 
-  consistency_batch_ratio: 0.25
+  flow_batch_ratio: 1
+  consistency_batch_ratio: 0
 
   sample_t_mode_flow: "beta" # choose between beta or lognorm, both are performing well
   sample_t_mode_consistency: "discrete" 
@@ -134,10 +134,10 @@ training:
   env_device: "cuda:0"
   seed: 42
   debug: False
-  resume: True
+  resume: False
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3010
+  num_epochs: 2010
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 50 
@@ -147,6 +147,8 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+  num_demos: null          # Use subset of demos (e.g., 20). null = use all.
+  num_batches: 10        # Fixed batches per epoch with RandomSampler. null = normal epoch.
 
 logging:
   group: ${exp_name}
@@ -167,6 +169,31 @@ checkpoint:
     format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
   save_last_ckpt: True # this only saves when save_ckpt is True
   save_last_snapshot: False
+
+# Critic-guided training configuration
+# Two modes available:
+# 1. AWR (acgd_enabled: False): Weight expert demos by Q-value
+# 2. ACGD (acgd_enabled: True): Maximize Q of student's predicted actions
+critic_guided:
+  enabled: False
+  critic_dir: "/home/nathan4074/Project/ManiFlow_Policy/runs/sb3_adroit_sac/models_1"
+  # Per-task state dims: door=39, hammer=46, pen=45, relocate=39
+  state_dim: 39
+  action_dim: 28
+  hidden_dim: 256
+
+  chunked_critic: True
+  chunk_size: 3
+
+  acgd_enabled: True
+  acgd_sample_steps: 4
+  acgd_alpha: 1.0
+  acgd_lambda: 0.01
+  acgd_warmup_epochs: 100
+
+  temperature: 0.5
+  weight_min: 0.1
+  weight_max: 4.0
 
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
