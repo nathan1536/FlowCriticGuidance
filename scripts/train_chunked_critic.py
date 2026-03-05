@@ -268,7 +268,6 @@ def train_chunked_critic(
     batch_size: int = 2048,
     save_dir: Path,
     diag_every: int = 10,
-    cql_alpha: float = 0.0,
     device: torch.device = torch.device("cpu"),
 ) -> TwinChunkedQCritic:
     """Train a TwinChunkedQCritic via MSE regression on multi-step returns."""
@@ -288,16 +287,12 @@ def train_chunked_critic(
     print(f"[ChunkedCritic] Network initialised on {device}")
     print(f"  input_dim = {state_dim} + {chunk_size}*{action_dim} = {state_dim + chunk_size * action_dim}")
     print(f"  params: {sum(p.numel() for p in critic.parameters()):,}")
-    if cql_alpha > 0:
-        print(f"  CQL regularisation: α = {cql_alpha}")
-
     best_loss = float("inf")
     os.makedirs(save_dir, exist_ok=True)
 
     for epoch in range(1, epochs + 1):
         perm = torch.randperm(N, device=device)
         epoch_loss = 0.0
-        epoch_cql = 0.0
         n_batches = 0
 
         for i in range(0, N, batch_size):
@@ -311,39 +306,23 @@ def train_chunked_critic(
             q0 = critic.q0(sa).squeeze(-1)
             q1 = critic.q1(sa).squeeze(-1)
 
-            loss_mse = nn.functional.mse_loss(q0, y) + nn.functional.mse_loss(q1, y)
-
-            # CQL regulariser: push down Q on random actions, push up on data actions
-            if cql_alpha > 0:
-                a_rand = torch.rand(bs, chunk_action_dim, device=device) * 2 - 1
-                sa_rand = torch.cat([s, a_rand], dim=-1)
-                q0_rand = critic.q0(sa_rand).squeeze(-1)
-                q1_rand = critic.q1(sa_rand).squeeze(-1)
-                # CQL penalty: E[Q(s, a_rand)] - E[Q(s, a_data)]
-                cql_loss = (q0_rand.mean() - q0.detach().mean()) + \
-                           (q1_rand.mean() - q1.detach().mean())
-                loss = loss_mse + cql_alpha * cql_loss
-                epoch_cql += cql_loss.item()
-            else:
-                loss = loss_mse
+            loss = nn.functional.mse_loss(q0, y) + nn.functional.mse_loss(q1, y)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss_mse.item()
+            epoch_loss += loss.item()
             n_batches += 1
 
         avg_loss = epoch_loss / max(n_batches, 1)
-        avg_cql = epoch_cql / max(n_batches, 1) if cql_alpha > 0 else 0.0
 
         if epoch % diag_every == 0 or epoch == 1:
             # Diagnostics use forward() which denormalises automatically
             diag = compute_chunked_q_diagnostics(critic, states, action_chunks)
 
-            cql_str = f"  cql={avg_cql:.4f}" if cql_alpha > 0 else ""
             print(
-                f"[Epoch {epoch:4d}/{epochs}] loss={avg_loss:.6f}{cql_str}  |  "
+                f"[Epoch {epoch:4d}/{epochs}] loss={avg_loss:.6f}  |  "
                 f"Q(exp)={diag['q_expert']:.2f}  "
                 f"Q(n0.01)={diag['q_noisy_0.01']:.2f}  "
                 f"Q(n0.05)={diag['q_noisy_0.05']:.2f}  "
@@ -391,9 +370,6 @@ def parse_args():
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--diag-every", type=int, default=10)
-    p.add_argument("--cql-alpha", type=float, default=0.0,
-                   help="CQL conservative regularisation weight. Pushes down Q on random "
-                        "actions to prevent OOD exploitation. 0 = disabled. Try 1.0-5.0.")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -482,7 +458,6 @@ def main():
         save_dir=save_dir,
         diag_every=args.diag_every,
         device=device,
-        cql_alpha=args.cql_alpha,
     )
 
 
