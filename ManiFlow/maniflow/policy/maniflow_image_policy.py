@@ -206,6 +206,67 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         
         return result
 
+    def predict_action_q_guided(
+            self,
+            obs_dict: Dict[str, torch.Tensor],
+            critic,
+            n_candidates: int = 10,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Q-guided action selection (DiffusionQL-style inference).
+        Samples n_candidates actions from the flow model, then selects
+        the action with probability proportional to softmax(Q).
+        """
+        nobs = self.normalizer.normalize(obs_dict)
+        value = next(iter(nobs.values()))
+        B, To = value.shape[:2]
+        T = self.horizon
+        Da = self.action_dim
+        Do = self.obs_feature_dim
+        To = self.n_obs_steps
+        device = self.device
+        dtype = self.dtype
+
+        # Encode observations
+        this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].to(device))
+        nobs_features = self.obs_encoder(this_nobs).to(device)
+        vis_cond = nobs_features.reshape(B, -1, Do)
+
+        # Repeat for n_candidates
+        vis_cond_rpt = vis_cond.repeat_interleave(n_candidates, dim=0)  # (B*n, ...)
+        cond_data_rpt = torch.zeros(B * n_candidates, T, Da, device=device, dtype=dtype)
+
+        # Sample n_candidates actions
+        nsample_rpt = self.conditional_sample(
+            cond_data_rpt, vis_cond=vis_cond_rpt, **self.kwargs)
+        naction_rpt = nsample_rpt[..., :Da]
+        action_rpt = self.normalizer['action'].unnormalize(naction_rpt)
+
+        # Get first executed action for Q evaluation
+        start = To - 1
+        end = start + self.n_action_steps
+        a0_rpt = action_rpt[:, start].clamp(-1, 1)  # (B*n, action_dim)
+
+        # Get states for critic
+        states = obs_dict['full_state'][:, start].to(device)  # (B, state_dim)
+        states_rpt = states.repeat_interleave(n_candidates, dim=0)  # (B*n, state_dim)
+
+        # Evaluate Q and select via softmax sampling
+        with torch.no_grad():
+            q_vals = critic.q_min(states_rpt, a0_rpt).squeeze(-1)  # (B*n,)
+            q_vals = q_vals.view(B, n_candidates)
+            probs = torch.softmax(q_vals, dim=1)
+            idx = torch.multinomial(probs, 1).squeeze(-1)  # (B,)
+
+        # Select best actions
+        action_rpt = action_rpt.view(B, n_candidates, T, Da)
+        selected_actions = action_rpt[torch.arange(B, device=device), idx]  # (B, T, Da)
+
+        return {
+            'action': selected_actions[:, start:end],
+            'action_pred': selected_actions,
+        }
+
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
@@ -473,6 +534,139 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         v = self.model(x, t, target_t=target_t, vis_cond=vis_cond, lang_cond=lang_cond)
         return x + v * dt
 
+    def compute_guided_distillation_loss(
+            self,
+            batch,
+            vis_cond,
+            lang_cond,
+            critics: dict,
+            num_steps: int = 10,
+            guidance_scale: float = 0.01,
+            chunked_critic: bool = False,
+    ):
+        """
+        Q-guided distillation loss.
+
+        1. Generate Q-guided targets: run Euler steps (no grad through model),
+           add Q-gradient nudge at each step to push actions toward higher Q.
+        2. Generate student output: run Euler steps (with grad through model)
+           using the SAME noise.
+        3. Loss = MSE(student_output, guided_target)
+
+        The critic only evaluates actions close to model's output (near in-distribution),
+        avoiding the OOD problem of standard ACGD.
+        """
+        batch_size = vis_cond.shape[0]
+        device = self.device
+        dt_val = 1.0 / num_steps
+
+        noise = torch.randn(
+            batch_size, self.horizon, self.action_dim,
+            device=device, dtype=vis_cond.dtype
+        )
+
+        # Prepare states for critic evaluation
+        exec_start = self.n_obs_steps - 1
+        exec_end = exec_start + self.n_action_steps
+        limit = batch['obs']['full_state'].shape[1]
+        actual_end = min(exec_end, limit)
+        states = batch['obs']['full_state'][:, exec_start].to(device)
+        task_names = batch['obs']['task_name']
+
+        # Pre-compute task indices and critics
+        task_idx_map = {}
+        for task_name in set(task_names):
+            critic = critics.get(task_name)
+            if critic is not None:
+                idx = [j for j, tn in enumerate(task_names) if tn == task_name]
+                task_idx_map[task_name] = (torch.tensor(idx, device=device), critic)
+
+        # 1. Generate Q-guided targets
+        x = noise.clone()
+        for i in range(num_steps):
+            # Flow model forward (no grad through model)
+            with torch.no_grad():
+                t = torch.ones(batch_size, device=device) * (i / num_steps)
+                if self.sample_target_t_mode == "absolute":
+                    target_t = t + dt_val
+                elif self.sample_target_t_mode == "relative":
+                    target_t = torch.ones(batch_size, device=device) * dt_val
+
+                v = self.model(x, t, target_t=target_t, vis_cond=vis_cond, lang_cond=lang_cond)
+                x_next = x + v * dt_val
+
+            # Q-gradient nudge (needs grad enabled for autograd)
+            if len(task_idx_map) > 0:
+                x_for_grad = x_next.detach().requires_grad_(True)
+
+                with torch.enable_grad():
+                    action_raw = self.normalizer['action'].unnormalize(x_for_grad)
+                    action_clamped = action_raw.clamp(-1.0, 1.0)
+
+                    total_q = torch.tensor(0.0, device=device)
+                    for task_name, (idx_t, critic) in task_idx_map.items():
+                        task_states = states[idx_t]
+                        if chunked_critic:
+                            task_acts = action_clamped[idx_t, exec_start:actual_end]
+                            sa = torch.cat([task_states, task_acts.reshape(len(idx_t), -1)], dim=-1)
+                        else:
+                            task_acts = action_clamped[idx_t, exec_start]
+                            sa = torch.cat([task_states, task_acts], dim=-1)
+                        total_q = total_q + critic(sa).sum()
+
+                    grad = torch.autograd.grad(total_q, x_for_grad)[0]
+
+                # Normalize gradient direction, control magnitude via guidance_scale
+                grad_norm = grad.flatten(1).norm(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-8)
+                x = x_next + guidance_scale * (grad / grad_norm)
+            else:
+                x = x_next
+
+        guided_target = x.detach()
+
+        # 2. Generate student output (with grad through model, same noise)
+        student_output = self.few_step_sample_for_training(
+            noise, vis_cond, lang_cond, num_steps=num_steps
+        )
+
+        # 3. Distillation loss: train model to match Q-guided targets
+        loss_distill = F.mse_loss(student_output, guided_target)
+
+        # 4. Logging (including ensemble disagreement for OOD detection)
+        disagree_student = 0.0
+        disagree_expert = 0.0
+        with torch.no_grad():
+            student_raw = self.normalizer['action'].unnormalize(student_output).clamp(-1, 1)
+            guided_raw = self.normalizer['action'].unnormalize(guided_target).clamp(-1, 1)
+            action_shift = (guided_raw - student_raw).norm(dim=-1).mean().item()
+
+            # Ensemble disagreement: measures if critic is evaluating OOD actions
+            # High student disagreement vs low expert disagreement = OOD
+            expert_actions = batch['action'][:, exec_start:actual_end].to(device)
+            student_actions_for_critic = student_raw[:, exec_start:actual_end]
+
+            for task_name, (idx_t, critic) in task_idx_map.items():
+                # Check if critic has twin Q-networks (q0, q1)
+                if not (hasattr(critic, 'q0') and hasattr(critic, 'q1')):
+                    continue
+                task_states = states[idx_t]
+
+                if chunked_critic:
+                    sa_stud = torch.cat([task_states, student_actions_for_critic[idx_t].reshape(len(idx_t), -1)], dim=-1)
+                    sa_exp = torch.cat([task_states, expert_actions[idx_t].reshape(len(idx_t), -1)], dim=-1)
+                else:
+                    sa_stud = torch.cat([task_states, student_actions_for_critic[idx_t, 0]], dim=-1)
+                    sa_exp = torch.cat([task_states, expert_actions[idx_t, 0]], dim=-1)
+
+                disagree_student += (critic.q0(sa_stud) - critic.q1(sa_stud)).abs().mean().item()
+                disagree_expert += (critic.q0(sa_exp) - critic.q1(sa_exp)).abs().mean().item()
+
+            n_tasks = max(len(task_idx_map), 1)
+            disagree_student /= n_tasks
+            disagree_expert /= n_tasks
+
+        return loss_distill, action_shift, disagree_student, disagree_expert
+
     def compute_acgd_loss(
             self,
             batch,
@@ -492,7 +686,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         batch_size = vis_cond.shape[0]
         device = self.device
 
-        # 1. Sample noise and generate student actions (same as before)
+        # 1. Sample noise and generate student actions
         noise = torch.randn(
             batch_size, self.horizon, self.action_dim,
             device=device, dtype=vis_cond.dtype
@@ -506,11 +700,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         student_action_raw = student_action_raw.clamp(-1.0, 1.0)
         student_action_raw = student_action_raw.to(device)
 
-        # 2. Prepare data slices (Vectorized slicing)
-        # Use the timestep that will actually be executed at inference
+        # 2. Prepare data slices
         exec_start = self.n_obs_steps - 1
         exec_end = exec_start + self.n_action_steps
-
 
         limit = batch['obs']['full_state'].shape[1]
         actual_end = min(exec_end, limit)
@@ -521,83 +713,75 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         task_names = batch['obs']['task_name']
 
-        # 3. Group by Task to batch critic calls
-        # We process unique tasks one by one, but batch all samples for that task
+        # 3. Group by task and evaluate
         unique_tasks = set(task_names)
 
         per_task_losses = []
         all_q_student = []
         all_q_expert = []
+        disagree_student_sum = 0.0
+        disagree_expert_sum = 0.0
+        n_disagree_tasks = 0
 
         for task_name in unique_tasks:
             critic = critics.get(task_name)
             if critic is None:
                 continue
 
-            # Find all batch indices belonging to this task
             task_indices = [i for i, t in enumerate(task_names) if t == task_name]
             task_indices_tensor = torch.tensor(task_indices, device=device)
 
-            # Gather data for this task: (B_task, T_slice, Dim)
             task_states = relevant_states[task_indices_tensor]
             task_stud_acts = relevant_student_actions[task_indices_tensor]
             task_exp_acts = relevant_expert_actions[task_indices_tensor]
 
             if chunked_critic:
-                # Chunked critic: Q(s_t, [a_t, a_{t+1}, ..., a_{t+k-1}])
-                # Take first state, flatten action chunk
                 sa_student = torch.cat([task_states[:, 0], task_stud_acts.reshape(task_stud_acts.shape[0], -1)], dim=-1)
                 sa_expert = torch.cat([task_states[:, 0], task_exp_acts.reshape(task_exp_acts.shape[0], -1)], dim=-1)
             else:
-                # Single-step critic: Q(s_t, a_t) — original path
                 sa_student = torch.cat([task_states, task_stud_acts], dim=-1)
                 sa_expert = torch.cat([task_states, task_exp_acts], dim=-1)
-            
-            # # Prepare inputs
-            # sa_student = torch.cat([flat_states, flat_stud_acts], dim=-1)
-            # sa_expert = torch.cat([flat_states, flat_exp_acts], dim=-1)
-            
+
             # 4. Batched Critic Evaluation
-            # Student Q (keep gradients)
             q_student_per_sample = critic(sa_student).mean(-1)
 
-            # Expert Q (no gradients, for logging only)
             with torch.no_grad():
                 q_expert_per_sample = critic(sa_expert).mean(-1)
 
-            # 5. Compute Stats & Normalization
-            #   α = η / E|Q|,  L_q = -α · E[Q(s, a_student)]
-            # Scale-invariant across tasks and training stages.
-            # η is hvia acgd_lambda in the outer loss.
+                # Ensemble disagreement (OOD diagnostic)
+                if hasattr(critic, 'q0') and hasattr(critic, 'q1'):
+                    disagree_student_sum += (critic.q0(sa_student) - critic.q1(sa_student)).abs().mean().item()
+                    disagree_expert_sum += (critic.q0(sa_expert) - critic.q1(sa_expert)).abs().mean().item()
+                    n_disagree_tasks += 1
+
+            # 5. Normalized loss: L_q = -E[Q(s, a_student)] / E|Q|
             q_abs_mean = q_student_per_sample.detach().abs().mean().clamp(min=1.0)
             task_loss = -q_student_per_sample.mean() / q_abs_mean
-
-            # # --- Previous
-            # expert_mean = q_expert_per_sample.mean()
-            # expert_std = q_expert_per_sample.std(unbiased=False)
-            # expert_std = torch.clamp(expert_std, min=1.0)
-            #
-            # per_sample_gap = (q_expert_per_sample.detach() - q_student_per_sample) / expert_std
-            # task_loss = F.softplus(per_sample_gap, beta=2.0).mean()
-            # # --- End 
 
             per_task_losses.append(task_loss)
             all_q_student.append(q_student_per_sample.mean().detach())
             all_q_expert.append(q_expert_per_sample.mean().detach())
 
-            # 6. Final Aggregation
-            if len(per_task_losses) > 0:
-                loss_distill = torch.stack(per_task_losses).mean()
-                q_student_mean = torch.stack(all_q_student).mean()
-                q_expert_mean = torch.stack(all_q_expert).mean()
-            else:
-                loss_distill = torch.tensor(0.0, device=device, requires_grad=True)
-                q_student_mean = torch.tensor(0.0, device=device)
-                q_expert_mean = torch.tensor(0.0, device=device)
+        # 6. Final Aggregation (outside per-task loop)
+        if len(per_task_losses) > 0:
+            loss_distill = torch.stack(per_task_losses).mean()
+            q_student_mean = torch.stack(all_q_student).mean()
+            q_expert_mean = torch.stack(all_q_expert).mean()
+        else:
+            loss_distill = torch.tensor(0.0, device=device, requires_grad=True)
+            q_student_mean = torch.tensor(0.0, device=device)
+            q_expert_mean = torch.tensor(0.0, device=device)
 
-            q_gap = q_expert_mean - q_student_mean
+        q_gap = q_expert_mean - q_student_mean
 
-        return loss_distill, q_student_mean, q_expert_mean, q_gap
+        if n_disagree_tasks > 0:
+            disagree_student = disagree_student_sum / n_disagree_tasks
+            disagree_expert = disagree_expert_sum / n_disagree_tasks
+        else:
+            disagree_student = 0.0
+            disagree_expert = 0.0
+
+        return loss_distill, q_student_mean, q_expert_mean, q_gap, disagree_student, disagree_expert
 
     def compute_critic_weights(
         self,
@@ -672,6 +856,63 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         weights = torch.exp(advantage / temperature).clamp(min=weight_min, max=weight_max)
 
         return weights, q_values, advantage
+
+    def compute_flowql_loss(
+            self,
+            batch,
+            vis_cond,
+            lang_cond,
+            critic,
+            num_steps: int = 4,
+    ):
+        """
+        DiffusionQL-style Q-loss: L_q = -Q(s, π(s)) / E|Q|
+
+        Samples actions from the flow model via Euler steps (with gradients),
+        evaluates Q(s, a_0) using the twin critic, and returns the normalized
+        negative Q-value loss. Uses random Q-network alternation for stability
+        (Wang et al., ICLR 2023).
+        """
+        batch_size = vis_cond.shape[0]
+        device = self.device
+
+        # 1. Sample actions from flow model (with gradient flow)
+        noise = torch.randn(
+            batch_size, self.horizon, self.action_dim,
+            device=device, dtype=vis_cond.dtype,
+        )
+        sampled_actions_norm = self.few_step_sample_for_training(
+            noise, vis_cond, lang_cond, num_steps=num_steps,
+        )
+
+        # 2. Unnormalize and take first executed action
+        action_raw = self.normalizer['action'].unnormalize(sampled_actions_norm)
+        action_raw = action_raw.clamp(-1.0, 1.0)
+        exec_start = self.n_obs_steps - 1
+        a0 = action_raw[:, exec_start]  # (B, action_dim)
+
+        # 3. Get states for critic
+        states = batch['obs']['full_state'][:, exec_start].to(device)  # (B, state_dim)
+
+        # 4. Evaluate twin Q-networks
+        q0, q1 = critic(states, a0)  # each (B, 1)
+
+        # 5. DiffusionQL loss with random Q alternation
+        if torch.rand(1).item() > 0.5:
+            q_loss = -q0.mean() / q1.abs().mean().detach().clamp(min=1.0)
+        else:
+            q_loss = -q1.mean() / q0.abs().mean().detach().clamp(min=1.0)
+
+        # 6. Logging
+        with torch.no_grad():
+            q_mean = torch.min(q0, q1).mean().item()
+            q_std = torch.min(q0, q1).std().item()
+
+        return q_loss, {
+            'flowql_q_mean': q_mean,
+            'flowql_q_std': q_std,
+            'flowql_q_loss': q_loss.item(),
+        }
 
     def compute_loss(self, batch, ema_model=None, critics=None, critic_cfg=None, **kwargs):
         # normalize input
@@ -806,20 +1047,37 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         loss_bc = loss_bc.mean()
         
-        # ACGD: Add distillation loss that maximizes Q of student's predicted actions
+        # ACGD: Q-guided distillation loss
         loss_distill = torch.tensor(0.0, device=self.device)
+        # acgd_action_shift = 0.0
+        # acgd_disagree_student = 0.0
+        # acgd_disagree_expert = 0.0
+        # # --- Original ACGD (backprop -Q through full chain) ---
         acgd_q_student = 0.0
         acgd_q_expert = 0.0
         acgd_q_gap = 0.0
-        
+
         if use_acgd and use_critics and acgd_active:
             acgd_alpha = critic_cfg.get("acgd_alpha", 1.0)
-            acgd_lambda = critic_cfg.get("acgd_lambda", 0.3)
+            acgd_lambda_max = critic_cfg.get("acgd_lambda", 0.3)
             acgd_sample_steps = critic_cfg.get("acgd_sample_steps", 4)
-            
-            # Compute ACGD distillation loss: -Q(s, π_θ(s,o,t))
+
+            # Linear annealing: ramp λ from 0 → λ_max over acgd_ramp_epochs after warmup
+            acgd_ramp_epochs = critic_cfg.get("acgd_ramp_epochs", 50)
+            epochs_since_warmup = current_epoch - acgd_warmup_epochs
+            if acgd_ramp_epochs > 0 and epochs_since_warmup < acgd_ramp_epochs:
+                acgd_lambda = acgd_lambda_max * (epochs_since_warmup / acgd_ramp_epochs)
+            else:
+                acgd_lambda = acgd_lambda_max
+
+            # Q-guided distillation: nudge actions toward higher Q at each Euler step
             is_chunked = critic_cfg.get("chunked_critic", False)
-            loss_distill, acgd_q_student, acgd_q_expert, acgd_q_gap = self.compute_acgd_loss(
+            # acgd_guidance_scale = critic_cfg.get("acgd_guidance_scale", 0.01)
+            # loss_distill, acgd_action_shift, acgd_disagree_student, acgd_disagree_expert = self.compute_guided_distillation_loss(
+            #     batch, vis_cond, lang_cond, critics, num_steps=acgd_sample_steps,
+            #     guidance_scale=acgd_guidance_scale, chunked_critic=is_chunked,
+            # )
+            loss_distill, acgd_q_student, acgd_q_expert, acgd_q_gap, acgd_disagree_student, acgd_disagree_expert = self.compute_acgd_loss(
                 batch, vis_cond, lang_cond, critics, num_steps=acgd_sample_steps,
                 chunked_critic=is_chunked,
             )
@@ -854,13 +1112,17 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         
         # Log ACGD stats (only in ACGD mode)
         if use_acgd and use_critics:
-            loss_dict['acgd_active'] = 1.0 if acgd_active else 0.0  # Whether ACGD is enabled (after warmup)
+            loss_dict['acgd_active'] = 1.0 if acgd_active else 0.0
             if acgd_active:
+                loss_dict['acgd_lambda'] = acgd_lambda
                 loss_dict['acgd_loss_distill'] = loss_distill.item()
-                loss_dict['acgd_q_student'] = acgd_q_student      # Q(s, student_action)
-                loss_dict['acgd_q_expert'] = acgd_q_expert        # Q(s, expert_action)
-                loss_dict['acgd_q_gap'] = acgd_q_gap              # expert - student (positive = critic prefers expert)
                 loss_dict['acgd_total_loss'] = loss.item()
+                loss_dict['acgd_q_student'] = acgd_q_student
+                loss_dict['acgd_q_expert'] = acgd_q_expert
+                loss_dict['acgd_q_gap'] = acgd_q_gap
+                loss_dict['acgd_disagree_student'] = acgd_disagree_student
+                loss_dict['acgd_disagree_expert'] = acgd_disagree_expert
+                loss_dict['acgd_disagree_ratio'] = acgd_disagree_student / max(acgd_disagree_expert, 1e-8)
             
 
         return loss, loss_dict

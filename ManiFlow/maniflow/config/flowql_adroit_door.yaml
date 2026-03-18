@@ -1,0 +1,198 @@
+defaults:
+  - task: adroit_door_image
+
+name: train_flowql_adroit_door
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "flowql_door"
+
+horizon: 1
+n_obs_steps: 1
+n_action_steps: 1
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTX"
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  visual_cond_len: 1024
+  max_lang_cond_len: 1024
+  qkv_bias: false
+  qk_norm: false
+
+  language_conditioned: false
+  pre_norm_modality: false
+
+  flow_batch_ratio: 1.0
+  consistency_batch_ratio: 0.0
+
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete"
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: 'r3m'
+    pretrained: False
+    frozen: False
+    global_pool: ''
+    feature_aggregation: null
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees: [-5.0, 5.0]
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 384
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 1210
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 100
+  checkpoint_every: 200
+  val_every: 100
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  num_demos: null
+  num_batches: 100
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: FlowQL
+  resume: False
+  tags:
+  - ${logging.project}
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 3
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+# FlowQL: DiffusionQL-style online critic training
+flowql:
+  enabled: true
+  eta: 0.1                 # Q-loss weight (paper uses 0.15 for Adroit pen)
+  alpha: 1.0               # BC (flow) loss weight
+  discount: 0.99           # TD discount factor γ
+  tau: 0.005               # target network soft update rate
+  critic_lr: 3.0e-4        # critic learning rate
+  state_dim: 39            # door full_state dim
+  action_dim: 28           # door action dim
+  critic_hidden_dim: 256
+  num_sample_steps: 10      # Euler steps for sampling π(s)
+  grad_norm: 8.0         # gradient clipping
+  max_q_backup: false      # max over 10 action samples for target Q
+  reward_tune: "normalize"   # reward standardization: "normalize" (z-score) or "no"
+  lr_decay: true             # CosineAnnealingLR for critic (same as DiffusionQL)
+  warmup_epochs: 0    # epochs of BC-only before enabling QL
+  ema_decay: 0.995         # EMA decay for actor (used by DiffusionQL)
+  update_ema_every: 5      # update EMA every N steps
+
+# Override task: obs horizons must match n_obs_steps=1, and load RL signals
+task:
+  shape_meta:
+    obs:
+      image:
+        shape: [3, 84, 84]
+        type: rgb
+        horizon: 1
+      agent_pos:
+        shape: [24]
+        type: low_dim
+        horizon: 1
+    action:
+      shape: [28]
+      horizon: 1
+  dataset:
+    zarr_path: ../runs/sb3_adroit_sac/models/door/replay_buffer_t1000000.zarr
+    use_rl_signals: true
+    task_name: door
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
