@@ -144,8 +144,10 @@ def _save_replay_buffer_to_zarr(
     if task_key in ADROIT_OBS_HAND_SLICES:
         slicer = ADROIT_OBS_HAND_SLICES[task_key]
         state_arr = slicer(full_state_arr).astype(np.float32)
+        next_state_arr = slicer(next_full_state_arr).astype(np.float32)
     else:
         state_arr = full_state_arr.copy()
+        next_state_arr = next_full_state_arr.copy()
 
     # Compute Q(s,a), V(s), advantage using SAC twin critics
     print(f"[ReplayBuffer] Computing Q/V/advantage for {save_size} transitions ...")
@@ -203,6 +205,7 @@ def _save_replay_buffer_to_zarr(
     _save("full_state", full_state_arr)
     _save("next_full_state", next_full_state_arr)
     _save("state", state_arr)
+    _save("next_state", next_state_arr)
     _save("action", act_arr)
     _save("reward", rew_arr, chunks=(min(100, save_size),))
     _save("done", done_arr, chunks=(min(100, save_size),))
@@ -214,32 +217,68 @@ def _save_replay_buffer_to_zarr(
     has_images = False
     if env is not None and getattr(env, "_store_sim_states", False):
         cam = camera_name or ADROIT_CAMERAS.get(task_key, "top")
-        print(f"[ReplayBuffer] Rendering {save_size} images "
+        print(f"[ReplayBuffer] Rendering {save_size} images + next_images "
               f"({image_size}x{image_size}, camera={cam}) ...")
         mj_env = env.env  # underlying mj_envs environment
-        img_list = []
-        for i in range(offset, buf_size):
-            sim_state = env._sim_states[i]
-            if sim_state is None:
-                # Buffer hasn't filled this slot yet — use a black image
-                img_list.append(np.zeros((image_size, image_size, 3), dtype=np.uint8))
-                continue
-            mj_env.set_env_state(sim_state)
-            img = mj_env.sim.render(
-                width=image_size, height=image_size,
-                mode="offscreen", camera_name=cam, device_id=device_id,
-            )
-            img_list.append(img.astype(np.uint8))
-            if (len(img_list)) % 50000 == 0:
-                print(f"  rendered {len(img_list)}/{save_size} ...")
-        img_arr = np.stack(img_list, axis=0)  # (N, H, W, 3) channel-last
-        zarr_data.create_dataset(
-            "img", data=img_arr,
-            chunks=(100, *img_arr.shape[1:]),
+        img_shape = (image_size, image_size, 3)
+        img_dataset = zarr_data.create_dataset(
+            "img", shape=(save_size, *img_shape),
+            chunks=(100, *img_shape),
             dtype="uint8", overwrite=True, compressor=compressor,
         )
+        next_img_dataset = zarr_data.create_dataset(
+            "next_img", shape=(save_size, *img_shape),
+            chunks=(100, *img_shape),
+            dtype="uint8", overwrite=True, compressor=compressor,
+        )
+
+        # Build set of episode-end indices for boundary detection
+        ep_end_set = set(episode_ends.tolist())
+
+        # Stream images directly into zarr to avoid OOM
+        RENDER_BATCH = 1000
+        img_batch = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
+        next_img_batch = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
+        batch_idx = 0
+        batch_start = 0
+
+        def _render_sim_state(state):
+            if state is None:
+                return np.zeros(img_shape, dtype=np.uint8)
+            mj_env.set_env_state(state)
+            return mj_env.sim.render(
+                width=image_size, height=image_size,
+                mode="offscreen", camera_name=cam, device_id=device_id,
+            ).astype(np.uint8)
+
+        for i in range(offset, buf_size):
+            local_idx = i - offset  # index in the saved arrays
+
+            # Current image
+            img_batch[batch_idx] = _render_sim_state(env._sim_states[i])
+
+            # Next image: use sim_states[i+1] if within same episode, else black
+            is_terminal = (local_idx + 1) in ep_end_set
+            if is_terminal or (i + 1) >= buf_size:
+                next_img_batch[batch_idx] = 0  # terminal or buffer end → black
+            else:
+                next_img_batch[batch_idx] = _render_sim_state(env._sim_states[i + 1])
+
+            batch_idx += 1
+            if batch_idx == RENDER_BATCH:
+                img_dataset[batch_start:batch_start + batch_idx] = img_batch[:batch_idx]
+                next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
+                batch_start += batch_idx
+                batch_idx = 0
+            if (local_idx + 1) % 50000 == 0:
+                print(f"  rendered {local_idx + 1}/{save_size} ...")
+        # Flush remaining
+        if batch_idx > 0:
+            img_dataset[batch_start:batch_start + batch_idx] = img_batch[:batch_idx]
+            next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
         has_images = True
-        print(f"  images saved: shape={img_arr.shape}")
+        print(f"  images saved: shape={img_dataset.shape}")
+        print(f"  next_images saved: shape={next_img_dataset.shape}")
 
     zarr_meta.create_dataset(
         "episode_ends", data=episode_ends,
@@ -255,7 +294,7 @@ def _save_replay_buffer_to_zarr(
     print(f"  transitions : {save_size}" + (f" (last {save_last_n} of {buf_size})" if offset > 0 else ""))
     print(f"  episodes    : {n_episodes}")
     if has_images:
-        print(f"  images      : {img_arr.shape}")
+        print(f"  images      : ({save_size}, {image_size}, {image_size}, 3) [img + next_img]")
     print(f"  ep lengths  : mean={ep_lens.mean():.1f} min={ep_lens.min()} max={ep_lens.max()}")
     print(f"  ep rewards  : mean={ep_rewards.mean():.1f} std={ep_rewards.std():.1f} "
           f"min={ep_rewards.min():.1f} max={ep_rewards.max():.1f}")
@@ -287,13 +326,13 @@ def parse_args():
     # ── Environment / general ──
     p.add_argument("--task", type=str, default="door",
                    help="Adroit task name (door, hammer, pen, relocate)")
-    p.add_argument("--total-timesteps", type=int, default=5_000_000)
+    p.add_argument("--total-timesteps", type=int, default=1_600_000)
     p.add_argument("--n-envs", type=int, default=1,
                    help="Number of parallel envs (mujoco-py rendering limits concurrency; 1 is safest)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", type=str, default="auto", help="SB3 device: auto|cpu|cuda")
     p.add_argument("--log-dir", type=str, default="runs/sb3_adroit_sac")
-    p.add_argument("--save-dir", type=str, default="runs/sb3_adroit_sac/models_1")
+    p.add_argument("--save-dir", type=str, default="runs/sb3_adroit_sac/models_84")
     p.add_argument("--monitor-dir", type=str, default="",
                    help="If set, write Monitor CSVs for reward curves.")
     p.add_argument("--tensorboard", action="store_true", default=True, help="Enable tensorboard logging")
@@ -335,12 +374,12 @@ def parse_args():
                    help="Only save the last N transitions to zarr (0 = save all).")
     p.add_argument("--no-images", action="store_true",
                    help="Skip image rendering when saving replay buffer to zarr.")
-    p.add_argument("--save-rb-at-success", type=float, default=0.0,
+    p.add_argument("--save-rb-at-success", type=float, default=0.8,
                    help="Only save replay buffer once when success rate first reaches this threshold "
                         "(e.g. 0.8). 0 = save at every checkpoint (default).")
     p.add_argument("--save-all-checkpoints", action="store_true",
                    help="Save a model checkpoint at every evaluation step.")
-    p.add_argument("--image-size", type=int, default=128,
+    p.add_argument("--image-size", type=int, default=84,
                    help="Image size for replay buffer rendering (only with --save-replay-buffer).")
     p.add_argument("--camera", type=str, default="",
                    help="MuJoCo camera name (empty = use task default).")

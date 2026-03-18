@@ -68,6 +68,7 @@ class AdroitRunner(BaseRunner):
 
         all_goal_achieved = []
         all_success_rates = []
+        all_episode_rewards = []
         
 
 
@@ -81,6 +82,7 @@ class AdroitRunner(BaseRunner):
             done = False
             num_goal_achieved = 0
             actual_step_count = 0
+            episode_reward = 0.0
             while not done:
                 # create obs dict
                 np_obs_dict = dict(obs)
@@ -112,11 +114,13 @@ class AdroitRunner(BaseRunner):
                 obs, reward, done, info = env.step(action)
                 # all_goal_achieved.append(info['goal_achieved']
                 num_goal_achieved += np.sum(info['goal_achieved'])
+                episode_reward += np.sum(reward)
                 done = np.all(done)
                 actual_step_count += 1
 
             all_success_rates.append(info['goal_achieved'])
             all_goal_achieved.append(num_goal_achieved)
+            all_episode_rewards.append(episode_reward)
 
 
         # log
@@ -128,7 +132,9 @@ class AdroitRunner(BaseRunner):
 
         log_data['test_mean_score'] = np.mean(all_success_rates)
 
-        cprint(f"test_mean_score: {np.mean(all_success_rates)}", 'green')
+        log_data['mean_episode_reward'] = np.mean(all_episode_rewards)
+        log_data['std_episode_reward'] = np.std(all_episode_rewards)
+        cprint(f"test_mean_score: {np.mean(all_success_rates)}, mean_reward: {np.mean(all_episode_rewards):.1f} ± {np.std(all_episode_rewards):.1f}", 'green')
 
         self.logger_util_test.record(np.mean(all_success_rates))
         self.logger_util_test10.record(np.mean(all_success_rates))

@@ -3,6 +3,8 @@ import torch
 import numpy as np
 import copy
 import zarr
+import numcodecs
+numcodecs.blosc.use_threads = False  # <--- ADD THIS to fix CPU gridlock
 from maniflow.common.pytorch_util import dict_apply
 from maniflow.common.replay_buffer import ReplayBuffer
 from maniflow.common.sampler import (SequenceSampler, get_val_mask, downsample_mask)
@@ -23,6 +25,7 @@ class AdroitImageDataset(BaseDataset):
             use_img=True,
             use_depth=False,
             use_full_state=True,
+            use_rl_signals=False,
             ):
         super().__init__()
         cprint(f'Loading AdroitImageDataset from {zarr_path}', 'green')
@@ -30,29 +33,50 @@ class AdroitImageDataset(BaseDataset):
         self.use_img = use_img
         self.use_depth = use_depth
         self.use_full_state = use_full_state
+        self.use_rl_signals = use_rl_signals
 
 
         buffer_keys = [
             'state', 
             'action',]
         
+        # Lazy load img from zarr (avoid ~46GB in RAM)
+        self.lazy_img_zarr = None
         if self.use_img:
-            buffer_keys.append('img')
+            #self.lazy_img_zarr = zarr.open(zarr_path, mode='r')['data']['img']
+            cprint(f'  Images: deferred lazy zarr loading setup', 'yellow')
+            # Don't add 'img' to buffer_keys — load on demand in __getitem__
         if self.use_depth:
             buffer_keys.append('depth')
         if self.use_full_state:
             buffer_keys.append('full_state')
 
         self.has_v_value = False
-        if self.use_full_state:
-            try:
-                _zr = zarr.open(zarr_path, mode='r')
-                if 'v_value' in _zr['data']:
-                    buffer_keys.append('v_value')
-                    self.has_v_value = True
-                    cprint('  Found v_value in zarr -> loading for advantage weighting', 'cyan')
-            except Exception:
-                pass
+        self.has_rl_signals = False
+        self.has_next_img = False
+        try:
+            _zr = zarr.open(zarr_path, mode='r')
+            # Only load v_value for advantage weighting if NOT using RL signals (FlowQL trains its own critic)
+            if self.use_full_state and 'v_value' in _zr['data'] and not self.use_rl_signals:
+                buffer_keys.append('v_value')
+                self.has_v_value = True
+                cprint('  Found v_value in zarr -> loading for advantage weighting', 'cyan')
+            if self.use_rl_signals:
+                rl_keys = ['reward', 'done', 'next_full_state', 'next_state']
+                available = [k for k in rl_keys if k in _zr['data']]
+                if len(available) == len(rl_keys):
+                    buffer_keys.extend(rl_keys)
+                    self.has_rl_signals = True
+                    cprint('  Found RL signals (reward, done, next_full_state, next_state) -> loading for FlowQL', 'cyan')
+                else:
+                    missing = set(rl_keys) - set(available)
+                    cprint(f'  WARNING: use_rl_signals=True but missing keys: {missing}', 'yellow')
+                # next_img: derive from img[t+1] at runtime (index-based, no extra storage)
+                self.has_next_img = self.use_img
+                if self.has_next_img:
+                    cprint('  Will derive next_img from img[t+1] (index-based lookup)', 'cyan')
+        except Exception:
+            pass
 
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path, keys=buffer_keys)
@@ -81,6 +105,12 @@ class AdroitImageDataset(BaseDataset):
         self.train_episodes_num = np.sum(train_mask)
         self.val_episodes_num = np.sum(val_mask)
 
+        # Precompute episode end indices for index-based next_img lookup
+        if self.has_next_img:
+            ep_ends = self.replay_buffer.episode_ends[:]
+            self._episode_end_set = set(ep_ends.tolist())
+            self._buffer_size = int(ep_ends[-1]) if len(ep_ends) > 0 else 0
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
@@ -107,7 +137,14 @@ class AdroitImageDataset(BaseDataset):
             normalizer['full_state'] = SingleFieldLinearNormalizer.create_identity()
         if self.has_v_value:
             normalizer['v_value'] = SingleFieldLinearNormalizer.create_identity()
-        
+        if self.has_rl_signals:
+            normalizer['reward'] = SingleFieldLinearNormalizer.create_identity()
+            normalizer['done'] = SingleFieldLinearNormalizer.create_identity()
+            normalizer['next_full_state'] = SingleFieldLinearNormalizer.create_identity()
+            normalizer['next_state'] = SingleFieldLinearNormalizer.create_identity()
+        if getattr(self, 'has_next_img', False):
+            normalizer['next_img'] = SingleFieldLinearNormalizer.create_identity()
+
         return normalizer
 
     def __len__(self) -> int:
@@ -115,31 +152,66 @@ class AdroitImageDataset(BaseDataset):
 
     def _sample_to_data(self, sample):
         agent_pos = sample['state'][:,].astype(np.float32)
-       
-        if self.use_img:
-            image = sample['img'][:,].astype(np.float32)
+
         if self.use_depth:
             depth = sample['depth'][:,].astype(np.float32)
-            
+
         data = {
             'obs': {
                 'agent_pos': agent_pos,
                 },
             'action': sample['action'].astype(np.float32)}
-        if self.use_img:
-            data['obs']['image'] = image
         if self.use_depth:
             data['obs']['depth'] = depth
         if self.use_full_state:
             data['obs']['full_state'] = sample['full_state'][:,].astype(np.float32)
         if self.has_v_value:
             data['obs']['v_value'] = sample['v_value'][:,].astype(np.float32)
-            
+        if self.has_rl_signals:
+            data['obs']['reward'] = sample['reward'][:,].astype(np.float32)
+            data['obs']['done'] = sample['done'][:,].astype(np.float32)
+            data['obs']['next_full_state'] = sample['next_full_state'][:,].astype(np.float32)
+            data['obs']['next_state'] = sample['next_state'][:,].astype(np.float32)
         return data
-    
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
+
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx \
+            = self.sampler.indices[idx]
+
+        # Lazy load img from zarr
+        if self.use_img:
+            # Each worker opens its own connection on the first pull!
+            if self.lazy_img_zarr is None:
+                self.lazy_img_zarr = zarr.open(self.zarr_path, mode='r')['data']['img']
+            img_sample = self.lazy_img_zarr[buffer_start_idx:buffer_end_idx]
+            seq_len = self.sampler.sequence_length
+            if (sample_start_idx > 0) or (sample_end_idx < seq_len):
+                img_data = np.zeros(
+                    (seq_len,) + img_sample.shape[1:], dtype=img_sample.dtype)
+                if sample_start_idx > 0:
+                    img_data[:sample_start_idx] = img_sample[0]
+                if sample_end_idx < seq_len:
+                    img_data[sample_end_idx:] = img_sample[-1]
+                img_data[sample_start_idx:sample_end_idx] = img_sample
+            else:
+                img_data = img_sample
+            data['obs']['image'] = img_data.astype(np.float32)
+
+        # Index-based next_img: img[t+1], black at episode boundaries
+        if self.has_next_img:
+            if self.lazy_img_zarr is None:
+                self.lazy_img_zarr = zarr.open(self.zarr_path, mode='r')['data']['img']
+            next_idx = buffer_start_idx + 1
+            if next_idx in self._episode_end_set or next_idx >= self._buffer_size:
+                next_img = np.zeros(self.lazy_img_zarr.shape[1:], dtype=np.uint8)
+            else:
+                next_img = self.lazy_img_zarr[next_idx]
+            # Add sequence dimension (T=1) to match img shape: (T, H, W, C)
+            data['obs']['next_img'] = next_img[np.newaxis].astype(np.float32)
+
         to_torch_function = lambda x: torch.from_numpy(x) if x.__class__.__name__ == 'ndarray' else x
         torch_data = dict_apply(data, to_torch_function)
         return torch_data

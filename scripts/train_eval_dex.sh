@@ -40,7 +40,7 @@ fi
 
 # Setup paths and configuration
 base_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-dataset_path=data/${processed_task_name}_expert.zarr # e.g., data/adroit_door_expert.zarr, data/dexart_faucet_expert.zarr, data/metaworld_basketball_expert.zarr
+dataset_path="${base_path}/runs/sb3_adroit_sac/models_84/door/replay_buffer_t1000000_84x.zarr" # e.g., data/adroit_door_expert.zarr, data/dexart_faucet_expert.zarr, data/metaworld_basketball_expert.zarr
 zarr_path="${base_path}/ManiFlow/${dataset_path}"
 exp_name=${task_name}-${alg_name}-${addition_info}
 run_dir="${base_path}/ManiFlow/data/outputs/${exp_name}_seed${seed}"

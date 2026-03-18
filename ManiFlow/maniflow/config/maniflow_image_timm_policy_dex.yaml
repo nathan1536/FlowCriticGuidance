@@ -7,9 +7,9 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
-horizon: 3
+horizon: 1
 n_obs_steps: 1
-n_action_steps: 3
+n_action_steps: 1
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
@@ -114,6 +114,7 @@ dataloader:
   shuffle: True
   pin_memory: True
   persistent_workers: True
+  drop_last: True
 
 val_dataloader:
   batch_size: 128
@@ -148,25 +149,25 @@ training:
   max_val_steps: null
   tqdm_interval_sec: 1.0
   num_demos: null          # Use subset of demos (e.g., 20). null = use all.
-  num_batches: 10        # Fixed batches per epoch with RandomSampler. null = normal epoch.
+  num_batches: 100        # Fixed batches per epoch with RandomSampler. null = normal epoch.
 
 logging:
   group: ${exp_name}
   id: null
   mode: online
   name: ${training.seed}
-  project: ManiFlow_2d
-  resume: true
+  project: FlowQL
+  resume: False
   tags:
   - ${logging.project}
 
 checkpoint:
-  save_ckpt: False # if True, save checkpoint every checkpoint_every
+  save_ckpt: True # if True, save checkpoint every checkpoint_every
   topk:
-    monitor_key: test_mean_score
+    monitor_key: test_mean_score_infer10
     mode: max
-    k: 0
-    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+    k: 1
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score_infer10:.3f}.ckpt'
   save_last_ckpt: True # this only saves when save_ckpt is True
   save_last_snapshot: False
 
@@ -175,21 +176,22 @@ checkpoint:
 # 1. AWR (acgd_enabled: False): Weight expert demos by Q-value
 # 2. ACGD (acgd_enabled: True): Maximize Q of student's predicted actions
 critic_guided:
-  enabled: False
-  critic_dir: "/home/nathan4074/Project/ManiFlow_Policy/runs/sb3_adroit_sac/models_1"
+  enabled: True
+  critic_dir: "/home/nathan4074/Project/ManiFlow_Policy/runs/sb3_adroit_sac/models_84"
   # Per-task state dims: door=39, hammer=46, pen=45, relocate=39
   state_dim: 39
   action_dim: 28
   hidden_dim: 256
 
-  chunked_critic: True
+  chunked_critic: False
   chunk_size: 3
 
   acgd_enabled: True
-  acgd_sample_steps: 4
+  acgd_sample_steps: 10
   acgd_alpha: 1.0
-  acgd_lambda: 0.01
+  acgd_lambda: 0.1
   acgd_warmup_epochs: 100
+  acgd_ramp_epochs: 50
 
   temperature: 0.5
   weight_min: 0.1

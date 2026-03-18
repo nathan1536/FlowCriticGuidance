@@ -27,6 +27,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _ensure_sb3_importable(repo_root: Path) -> None:
@@ -43,32 +44,100 @@ def _ensure_sb3_importable(repo_root: Path) -> None:
 # Network definitions
 # ═══════════════════════════════════════════════════════════════════════
 
-def build_chunked_q_network(
-    state_dim: int, action_dim: int, chunk_size: int, hidden_dim: int,
-) -> nn.Module:
-    """Q_chunk(s_t, a_t, a_{t+1}, ..., a_{t+k-1}) -> scalar."""
-    input_dim = state_dim + chunk_size * action_dim
-    return nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, 1),
-    )
+
+# ═══════════════════════════════════════════════════════════════════════
+# Network definitions (UPGRADED TO T-SAC TRANSFORMER)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TransformerChunkedQNetwork(nn.Module):
+    """
+    T-SAC: Transformer-based chunked critic.
+    Processes [State, Action_0, Action_1, ..., Action_{k-1}] as a sequence.
+    """
+    def __init__(
+        self, state_dim: int, action_dim: int, chunk_size: int, 
+        hidden_dim: int = 256, n_heads: int = 4, n_layers: int = 2
+    ):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+
+        # 1. Token Projections (Map state and actions to the same hidden dimension)
+        self.state_proj = nn.Linear(state_dim, hidden_dim)
+        self.action_proj = nn.Linear(action_dim, hidden_dim)
+
+        # 2. Positional Encoding
+        # Length is chunk_size + 1 (1 slot for state, k slots for actions)
+        self.pos_emb = nn.Parameter(torch.randn(1, 1 + chunk_size, hidden_dim) * 0.02)
+
+        # 3. Causal Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=n_heads, 
+            dim_feedforward=hidden_dim * 4,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True # Pre-LN is usually much more stable for RL
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # 4. Final Q-Value Head (Predicts scalar from the final token)
+        self.q_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, sa_chunk: torch.Tensor) -> torch.Tensor:
+        B = sa_chunk.shape[0]
+
+        # --- UNFLATTEN THE INPUT ---
+        # This makes it a drop-in replacement for your existing training loop!
+        state = sa_chunk[:, :self.state_dim]                                # (B, state_dim)
+        actions_flat = sa_chunk[:, self.state_dim:]                         # (B, chunk_size * action_dim)
+        actions = actions_flat.view(B, self.chunk_size, self.action_dim)    # (B, chunk_size, action_dim)
+
+        # --- EMBEDDING ---
+        state_emb = self.state_proj(state).unsqueeze(1)                     # (B, 1, hidden_dim)
+        action_emb = self.action_proj(actions)                              # (B, chunk_size, hidden_dim)
+
+        # Create sequence: [State, Action_0, Action_1, ..., Action_{k-1}]
+        seq = torch.cat([state_emb, action_emb], dim=1)                     # (B, 1 + chunk_size, hidden_dim)
+        
+        # Add positional embedding
+        seq = seq + self.pos_emb
+
+        # --- CAUSAL MASKING ---
+        # Prevents early actions from "seeing" future actions in the chunk during self-attention
+        seq_len = seq.shape[1]
+        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(seq.device)
+
+        # --- TRANSFORMER FORWARD PASS ---
+        # is_causal=True acts as an optimizer hint in newer PyTorch versions
+        out_seq = self.transformer(seq, mask=mask, is_causal=True)
+
+        # --- Q-VALUE PREDICTION ---
+        # Take the feature representation of the very last token in the sequence
+        final_token_out = out_seq[:, -1, :]                                 # (B, hidden_dim)
+        q_value = self.q_head(final_token_out)                              # (B, 1)
+
+        return q_value
 
 
 class TwinChunkedQCritic(nn.Module):
-    """Conservative twin-Q chunked critic: returns min(Q0, Q1).
-
-    """
+    """Conservative twin-Q chunked critic using Transformers."""
 
     def __init__(
         self, state_dim: int, action_dim: int, chunk_size: int, hidden_dim: int,
     ):
         super().__init__()
         self.chunk_size = chunk_size
-        self.q0 = build_chunked_q_network(state_dim, action_dim, chunk_size, hidden_dim)
-        self.q1 = build_chunked_q_network(state_dim, action_dim, chunk_size, hidden_dim)
+        
+        # Swap the old MLPs for the new Transformers!
+        self.q0 = TransformerChunkedQNetwork(state_dim, action_dim, chunk_size, hidden_dim)
+        self.q1 = TransformerChunkedQNetwork(state_dim, action_dim, chunk_size, hidden_dim)
+        
         # Target normalisation stats (persistent buffers saved in state_dict)
         self.register_buffer("target_mean", torch.tensor(0.0))
         self.register_buffer("target_std", torch.tensor(1.0))
@@ -85,6 +154,48 @@ class TwinChunkedQCritic(nn.Module):
         """Return min(Q0, Q1) denormalised to original Q-value scale."""
         q_norm = self.forward_normalised(sa_chunk)
         return q_norm * self.target_std + self.target_mean
+# def build_chunked_q_network(
+#     state_dim: int, action_dim: int, chunk_size: int, hidden_dim: int,
+# ) -> nn.Module:
+#     """Q_chunk(s_t, a_t, a_{t+1}, ..., a_{t+k-1}) -> scalar."""
+#     input_dim = state_dim + chunk_size * action_dim
+#     return nn.Sequential(
+#         nn.Linear(input_dim, hidden_dim),
+#         nn.ReLU(),
+#         nn.Linear(hidden_dim, hidden_dim),
+#         nn.ReLU(),
+#         nn.Linear(hidden_dim, 1),
+#     )
+
+
+# class TwinChunkedQCritic(nn.Module):
+#     """Conservative twin-Q chunked critic: returns min(Q0, Q1).
+
+#     """
+
+#     def __init__(
+#         self, state_dim: int, action_dim: int, chunk_size: int, hidden_dim: int,
+#     ):
+#         super().__init__()
+#         self.chunk_size = chunk_size
+#         self.q0 = build_chunked_q_network(state_dim, action_dim, chunk_size, hidden_dim)
+#         self.q1 = build_chunked_q_network(state_dim, action_dim, chunk_size, hidden_dim)
+#         # Target normalisation stats (persistent buffers saved in state_dict)
+#         self.register_buffer("target_mean", torch.tensor(0.0))
+#         self.register_buffer("target_std", torch.tensor(1.0))
+
+#     def set_target_stats(self, mean: float, std: float):
+#         self.target_mean.fill_(mean)
+#         self.target_std.fill_(max(std, 1e-8))
+
+#     def forward_normalised(self, sa_chunk: torch.Tensor) -> torch.Tensor:
+#         """Return min(Q0, Q1) in normalised space (for training loss)."""
+#         return torch.min(self.q0(sa_chunk), self.q1(sa_chunk))
+
+#     def forward(self, sa_chunk: torch.Tensor) -> torch.Tensor:
+#         """Return min(Q0, Q1) denormalised to original Q-value scale."""
+#         q_norm = self.forward_normalised(sa_chunk)
+#         return q_norm * self.target_std + self.target_mean
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -154,12 +265,17 @@ def compute_multistep_targets(
     episode_ends: np.ndarray, # (E,)  cumulative episode boundary indices
     gamma: float = 0.99,
     chunk_size: int = 3,
+    done: np.ndarray | None = None,  # (N,) 1.0 if terminal, 0.0 otherwise
 ):
     """
     Build chunked training data from replay buffer.
 
     For each valid index t (where t..t+chunk_size all lie within one episode):
-        y_t = Σ_{k=0}^{chunk_size-1} γ^k r_{t+k}  +  γ^{chunk_size} V(s_{t+chunk_size})
+        y_t = Σ_{k=0}^{chunk_size-1} γ^k r_{t+k} * alive_{t+k}
+              + γ^{chunk_size} V(s_{t+chunk_size}) * alive_{t+chunk_size}
+
+    Where alive_{t+k} = Π_{j=0}^{k-1} (1 - done[t+j]), i.e. zero out rewards
+    and bootstrap after any terminal transition within the chunk.
 
     Returns:
         states:       (M, state_dim)
@@ -190,12 +306,31 @@ def compute_multistep_targets(
     # Vectorised reward sum: r[t] + γ r[t+1] + γ² r[t+2]
     offsets = np.arange(chunk_size)[None, :]  # (1, chunk_size)
     reward_indices = valid[:, None] + offsets   # (M, chunk_size)
-    r_sum = (reward[reward_indices] * discounts[None, :]).sum(axis=1)
+
+    if done is not None:
+        # alive_mask[k] = Π_{j=0}^{k-1} (1 - done[t+j])
+        # r[t+0] always counts (alive_mask[0]=1), r[t+1] counts if done[t]==0, etc.
+        done_indices = valid[:, None] + offsets  # (M, chunk_size)
+        done_vals = done[done_indices]           # (M, chunk_size)
+        # Cumulative product of (1 - done), shifted right by 1 (first reward always alive)
+        not_done = 1.0 - done_vals               # (M, chunk_size)
+        alive_mask = np.ones_like(not_done)
+        alive_mask[:, 1:] = np.cumprod(not_done[:, :-1], axis=1)
+        r_sum = (reward[reward_indices] * discounts[None, :] * alive_mask).sum(axis=1)
+
+        # Bootstrap mask: only bootstrap if no done in the entire chunk
+        bootstrap_alive = np.prod(not_done, axis=1)  # (M,)
+        n_terminal = int((bootstrap_alive < 0.5).sum())
+        print(f"[ChunkedCritic] Terminal state masking: {n_terminal}/{len(valid)} chunks "
+              f"have a terminal transition (bootstrap zeroed)")
+    else:
+        r_sum = (reward[reward_indices] * discounts[None, :]).sum(axis=1)
+        bootstrap_alive = 1.0
 
     # Bootstrap: γ^{chunk_size} * V(s_{t+chunk_size})
     bootstrap_idx = valid + chunk_size
     bootstrap_v = v_value[bootstrap_idx]
-    targets = r_sum + (gamma ** chunk_size) * bootstrap_v
+    targets = r_sum + (gamma ** chunk_size) * bootstrap_v * bootstrap_alive
 
     # Collect states and flattened action chunks
     states_out = full_state[valid]  # (M, state_dim)
@@ -306,7 +441,36 @@ def train_chunked_critic(
             q0 = critic.q0(sa).squeeze(-1)
             q1 = critic.q1(sa).squeeze(-1)
 
-            loss = nn.functional.mse_loss(q0, y) + nn.functional.mse_loss(q1, y)
+
+            #loss = nn.functional.mse_loss(q0, y) + nn.functional.mse_loss(q1, y)
+
+            mse_loss = nn.functional.mse_loss(q0, y) + nn.functional.mse_loss(q1, y)
+
+            # CQL penalty: push down Q for random OOD actions
+            a_rand = torch.rand_like(a) * 2 - 1  # Uniform [-1, 1]
+            a_noisy = a + torch.randn_like(a) * 0.1 # Perturbed expert actions
+
+            sa_rand = torch.cat([s, a_rand], dim=-1)
+            sa_noisy = torch.cat([s, a_noisy], dim=-1)
+            
+            q0_rand = critic.q0(sa_rand).squeeze(-1)
+            q1_rand = critic.q1(sa_rand).squeeze(-1)
+            q0_noisy = critic.q0(sa_noisy).squeeze(-1)
+            q1_noisy = critic.q1(sa_noisy).squeeze(-1)
+
+            margin = -3.0
+            penalty_0_rand = F.relu(q0_rand - margin).mean()
+            penalty_1_rand = F.relu(q1_rand - margin).mean()
+            penalty_0_noisy = F.relu(q0_noisy - margin).mean()
+            penalty_1_noisy = F.relu(q1_noisy - margin).mean()
+            # CQL penalty: push down Q for random OOD actions   (L_cql = E_a~U[-1,1] [Q(s, a)] - E_a~D [Q(s, a)])
+            cql_weight = 1 
+            cql_loss = cql_weight * (
+                penalty_0_rand + penalty_1_rand + 
+                penalty_0_noisy + penalty_1_noisy
+            )
+
+            loss = mse_loss + cql_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -408,6 +572,11 @@ def main():
     action = np.array(data["action"], dtype=np.float32)
     reward = np.array(data["reward"], dtype=np.float32)
     episode_ends = np.array(meta["episode_ends"])
+    done_arr = np.array(data["done"], dtype=np.float32) if "done" in data else None
+    if done_arr is not None:
+        print(f"  Done array loaded: {int(done_arr.sum())} terminal transitions")
+    else:
+        print(f"  WARNING: no 'done' array in zarr — bootstrapping unconditionally")
 
     N = full_state.shape[0]
     state_dim = full_state.shape[1]
@@ -434,7 +603,7 @@ def main():
     # Compute multi-step return targets
     states_np, chunks_np, targets_np = compute_multistep_targets(
         full_state, action, reward, v_value, episode_ends,
-        gamma=args.gamma, chunk_size=args.chunk_size,
+        gamma=args.gamma, chunk_size=args.chunk_size, done=done_arr,
     )
 
     states_t = torch.tensor(states_np, dtype=torch.float32, device=device)

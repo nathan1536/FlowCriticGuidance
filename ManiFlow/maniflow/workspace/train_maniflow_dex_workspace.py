@@ -155,7 +155,7 @@ class TrainManiFlowDexWorkspace:
             chunk_size = critic_cfg.get("chunk_size", 3)
             for tn in task_names:
                 chunked_path = critic_dir / tn / "chunked_twin_critic_q.pt"
-                twin_path = critic_dir / tn / "sac_twin_critic_q.pt"
+                twin_path = critic_dir / tn / "sac_twin_critic_q_84x.pt"
                 single_path = critic_dir / tn / "best_expert_critic_q.pt"
 
                 if use_chunked and chunked_path.exists():
@@ -229,8 +229,6 @@ class TrainManiFlowDexWorkspace:
 
         num_batches = cfg.training.get("num_batches", None)
         if num_batches is not None:
-            # Tutor's style: one giant RandomSampler covering all epochs,
-            # iterate with next(iter(dataloader)) in the training loop.
             total_samples = cfg.dataloader.batch_size * num_batches * cfg.training.num_epochs
             sampler = RandomSampler(dataset, replacement=True, num_samples=total_samples)
             dataloader_cfg = dict(cfg.dataloader)
@@ -324,18 +322,18 @@ class TrainManiFlowDexWorkspace:
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         for local_epoch_idx in range(cfg.training.num_epochs):
+            t_epoch_start = time.time()
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
-
+            t_data_start = time.time()
             # If using RandomSampler (tutor's style): draw num_batches from the single iterator
             if train_dataloader_iter is not None:
-                epoch_batches = []
-                for _ in range(num_batches):
-                    epoch_batches.append(next(train_dataloader_iter))
+                epoch_batches = (next(train_dataloader_iter) for _ in range(num_batches))
                 epoch_iter = enumerate(epoch_batches)
             else:
                 epoch_iter = enumerate(train_dataloader)
+            t_data_end = time.time()
 
             # # --- Original: iterate over train_dataloader directly ---
             # with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
@@ -378,7 +376,9 @@ class TrainManiFlowDexWorkspace:
                     # step optimizer
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
                         # clip grad norm
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=cfg.training.get("max_grad_norm", 1.0))
+                        max_gn = cfg.training.get("max_grad_norm", 2.0)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_gn)
+                        loss_dict['grad_norm'] = grad_norm.item()
                         ###
                         self.optimizer.step()
                         self.optimizer.zero_grad()
@@ -422,6 +422,7 @@ class TrainManiFlowDexWorkspace:
 
             # at the end of each epoch
             # replace train_loss with epoch average
+            t_train_end = time.time()
             train_loss = np.mean(train_losses)
             step_log['train_loss'] = train_loss
 
@@ -440,7 +441,7 @@ class TrainManiFlowDexWorkspace:
             #     # print(f"rollout time: {t4-t3:.3f}")
             #     # log all
             #     step_log.update(runner_log)
-
+            t_rollout_start = time.time()
             rollout_multiple_inference_step = True
             if rollout_multiple_inference_step:
                 # run rollout
@@ -478,7 +479,7 @@ class TrainManiFlowDexWorkspace:
                     # print(f"rollout time: {t4-t3:.3f}")
                     # log all
                     step_log.update(runner_log)
-
+            t_rollout_end = time.time()
             # run validation
             if (self.epoch % cfg.training.val_every) == 0 and RUN_VALIDATION:
                 with torch.no_grad():
@@ -518,9 +519,9 @@ class TrainManiFlowDexWorkspace:
                     del pred_action
                     del mse
 
-            if env_runner is None:
-                step_log['test_mean_score'] = - train_loss
-                
+            if 'test_mean_score_infer10' not in step_log:
+                step_log['test_mean_score_infer10'] = 0
+
             # checkpoint
             if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
                 # checkpointing
@@ -548,6 +549,11 @@ class TrainManiFlowDexWorkspace:
             # end of epoch
             # log of last step is combined with validation and rollout
             wandb_run.log(step_log, step=self.global_step)
+            t_epoch_end = time.time()
+            cprint(f"[Epoch {self.epoch}] data={t_data_end-t_data_start:.1f}s "
+                   f"train={t_train_end-t_data_end:.1f}s "
+                   f"rollout={t_rollout_end-t_rollout_start:.1f}s "
+                   f"total={t_epoch_end-t_epoch_start:.1f}s", 'yellow')
             self.global_step += 1
             self.epoch += 1
             del step_log

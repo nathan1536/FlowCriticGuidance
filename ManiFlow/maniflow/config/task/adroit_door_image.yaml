@@ -9,14 +9,14 @@ shape_meta: &shape_meta
     image:
         shape: *image_shape
         type: rgb
-        horizon: 2
+        horizon: 1
     agent_pos:
       shape: [24]
       type: low_dim
-      horizon: 2
+      horizon: 1
   action:
     shape: [28]
-    horizon: 16
+    horizon: 1
 
 env_runner:
   _target_: maniflow.env_runner.adroit_runner_2d.AdroitRunner2D
@@ -30,12 +30,12 @@ env_runner:
 
 dataset:
   _target_: maniflow.dataset.adroit_image_dataset.AdroitImageDataset
-  zarr_path: data/adroit_door_expert.zarr
+  zarr_path: ../runs/sb3_adroit_sac/models/door/replay_buffer_t1000000.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
-  val_ratio: 0.02
+  val_ratio: 0
   max_train_episodes: null
   use_img: true
   use_depth: false

@@ -8,6 +8,7 @@
 .DS_Store
 __pycache__/
 scripts/plot/pdfs/
+README.md
 videos/
 run_3seed.sh
 visualizations/

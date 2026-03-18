@@ -74,14 +74,13 @@ class TrainFlowQLAdroitWorkspace:
         np.random.seed(seed)
         random.seed(seed)
 
-        # configure policy model
+
         self.model = hydra.utils.instantiate(cfg.policy)
 
         self.ema_model = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
-        # configure policy optimizer
         self.optimizer = hydra.utils.instantiate(
             cfg.optimizer, params=self.model.parameters())
 
@@ -156,7 +155,7 @@ class TrainFlowQLAdroitWorkspace:
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
 
-        # configure dataset
+
         dataset: BaseDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseDataset)
@@ -175,7 +174,7 @@ class TrainFlowQLAdroitWorkspace:
             train_dataloader_iter = None
         normalizer = dataset.get_normalizer()
 
-        # Reward standardization (DiffusionQL: reward_tune='normalize')
+        # Reward standardization 
         reward_tune = flowql_cfg.get("reward_tune", "normalize")
         if hasattr(dataset, 'has_rl_signals') and dataset.has_rl_signals and reward_tune != "no":
             reward_data = dataset.replay_buffer['reward']
@@ -215,7 +214,6 @@ class TrainFlowQLAdroitWorkspace:
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
-        # configure env (optional — may fail if mujoco/gym not available)
         env_runner = None
         try:
             env_runner = hydra.utils.instantiate(
@@ -246,7 +244,6 @@ class TrainFlowQLAdroitWorkspace:
             **cfg.checkpoint.topk
         )
 
-        # device transfer
         device = torch.device(cfg.training.device)
         self.model.to(device)
         if self.ema_model is not None:
@@ -299,11 +296,9 @@ class TrainFlowQLAdroitWorkspace:
                         next_states = batch['obs']['next_full_state'][:, exec_start]  # (B, state_dim)
 
                         with torch.no_grad():
-                            # Use EMA policy to generate next actions for target Q
                             ema_policy = self.ema_model if self.ema_model is not None else self.model
                             ema_policy.eval()
 
-                            # Encode NEXT-state observations for π(s') in TD target
                             next_obs_dict = {}
                             if 'next_img' in batch['obs']:
                                 next_obs_dict['image'] = batch['obs']['next_img'][:, :self.model.n_obs_steps]
@@ -362,11 +357,10 @@ class TrainFlowQLAdroitWorkspace:
                         critic_loss_val = critic_loss.item()
                         target_q_mean = target_q.mean().item()
 
-                    # ── 2. Policy update (BC flow loss + QL loss) ──
-                    # Inject task_name for the policy
+                    # 2. Policy update 
                     batch['obs']['task_name'] = [task_name] * batch_size
 
-                    # Compute BC (flow matching) loss
+                    # Compute flow loss
                     raw_loss, loss_dict = self.model.compute_loss(
                         batch, self.ema_model, epoch=self.epoch)
 
@@ -394,7 +388,6 @@ class TrainFlowQLAdroitWorkspace:
                     loss = total_loss / cfg.training.gradient_accumulate_every
                     loss.backward()
 
-                    # step optimizer
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
@@ -407,13 +400,12 @@ class TrainFlowQLAdroitWorkspace:
                     if cfg.training.use_ema:
                         ema.step(self.model)
 
-                    # ── 3. Soft update critic target ──
+                    # update critic target 
                     if ql_active:
                         with torch.no_grad():
                             for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
                                 tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
-                    # logging
                     raw_loss_cpu = raw_loss.item()
                     tepoch.set_postfix(loss=raw_loss_cpu, ql=ql_loss_val, critic=critic_loss_val, refresh=False)
                     train_losses.append(raw_loss_cpu)
@@ -460,7 +452,6 @@ class TrainFlowQLAdroitWorkspace:
                     runner_log = env_runner.run(policy)
                     for key in runner_log:
                         step_log[f"{key}_infer{inference_step}"] = runner_log[key]
-                    # Also log without suffix for checkpoint manager
                     if inference_step == cfg.policy.num_inference_steps:
                         step_log.update(runner_log)
             t_rollout_end = time.time()
@@ -486,7 +477,6 @@ class TrainFlowQLAdroitWorkspace:
             if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
                 if cfg.checkpoint.save_last_ckpt:
                     self.save_checkpoint()
-                # Ensure test_mean_score exists for topk checkpoint manager
                 if 'test_mean_score' not in step_log:
                     step_log['test_mean_score'] = -train_loss
                 metric_dict = {k.replace('/', '_'): v for k, v in step_log.items()}
@@ -500,7 +490,6 @@ class TrainFlowQLAdroitWorkspace:
             wandb_run.log(step_log, step=self.global_step)
             t_epoch_end = time.time()
 
-            # Timing breakdown
             cprint(f"[Epoch {self.epoch}] data={t_data_end-t_data_start:.1f}s "
                    f"train={t_train_end-t_data_end:.1f}s "
                    f"rollout={t_rollout_end-t_rollout_start:.1f}s "

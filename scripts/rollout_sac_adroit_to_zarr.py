@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Roll out a trained SB3 SAC policy on Adroit and save *successful* trajectories to Zarr.
+Roll out a trained SB3 SAC policy on Adroit and save  trajectories to Zarr.
 
 Saves RGB images + sensor state (agent_pos) + full gym state + actions + rewards.
 Only keeps episodes where goal_achieved is True at least once.
@@ -13,12 +13,6 @@ Example:
     --model runs/sb3_adroit_sac/models_1/door/best_model.zip \
     --num-success 50 \
     --out ManiFlow/data/adroit_door_sac_rgb.zarr
-
-  # Evaluation only (no zarr save)
-  python scripts/rollout_sac_adroit_to_zarr.py \
-    --task door \
-    --model runs/sb3_adroit_sac/models_1/door/best_model.zip \
-    --eval-episodes 20
 """
 
 import argparse
@@ -249,6 +243,7 @@ def main():
 
     img_arrays = []
     state_arrays = []             # sensor / agent_pos (24-dim qpos slice)
+    next_state_arrays = []        # next-step agent_pos (for FlowQL TD target)
     full_state_arrays = []        # full gym obs used by SAC
     next_full_state_arrays = []   # next-step full_state (for TD learning)
     action_arrays = []
@@ -271,6 +266,7 @@ def main():
 
         img_ep = []
         state_ep = []
+        next_state_ep = []
         full_state_ep = []
         next_full_state_ep = []
         action_ep = []
@@ -291,6 +287,7 @@ def main():
 
             full_state, reward, done, info = env.step(action)
             next_full_state_ep.append(np.asarray(full_state, dtype=np.float32))
+            next_state_ep.append(_get_sensor_state(env, task_key))
             reward_ep.append(float(reward))
             done_ep.append(1.0 if done else 0.0)
             steps += 1
@@ -311,6 +308,7 @@ def main():
         episode_ends.append(int(total_count))
         img_arrays.extend(img_ep)
         state_arrays.extend(state_ep)
+        next_state_arrays.extend(next_state_ep)
         full_state_arrays.extend(full_state_ep)
         next_full_state_arrays.extend(next_full_state_ep)
         action_arrays.extend(action_ep)
@@ -348,6 +346,7 @@ def main():
     if img_arr.shape[1] == 3:  # channel-first -> channel-last
         img_arr = np.transpose(img_arr, (0, 2, 3, 1))
     state_arr = np.stack(state_arrays, axis=0).astype(np.float32)
+    next_state_arr = np.stack(next_state_arrays, axis=0).astype(np.float32)
     full_state_arr = np.stack(full_state_arrays, axis=0).astype(np.float32)
     next_full_state_arr = np.stack(next_full_state_arrays, axis=0).astype(np.float32)
     act_arr = np.stack(action_arrays, axis=0).astype(np.float32)
@@ -360,6 +359,8 @@ def main():
     zarr_data.create_dataset("img", data=img_arr, chunks=(100, *img_arr.shape[1:]),
                              dtype="uint8", overwrite=True, compressor=compressor)
     zarr_data.create_dataset("state", data=state_arr, chunks=(100, state_arr.shape[1]),
+                             dtype="float32", overwrite=True, compressor=compressor)
+    zarr_data.create_dataset("next_state", data=next_state_arr, chunks=(100, next_state_arr.shape[1]),
                              dtype="float32", overwrite=True, compressor=compressor)
     zarr_data.create_dataset("full_state", data=full_state_arr, chunks=(100, full_state_arr.shape[1]),
                              dtype="float32", overwrite=True, compressor=compressor)
@@ -389,9 +390,10 @@ def main():
             s_t = torch.FloatTensor(full_state_arr[start:end]).to(_sac_device)
             a_t = torch.FloatTensor(act_arr[start:end]).to(_sac_device)
             sa = torch.cat([s_t, a_t], dim=-1)
-            q_from_data[start:end] = torch.min(
-                _qf0(sa), _qf1(sa)).squeeze(-1).cpu().numpy()
+            q_from_data[start:end] = torch.min(_qf0(sa), _qf1(sa)).squeeze(-1).cpu().numpy()
+
     adv_arr = q_from_data - v_value_arr
+
     zarr_data.create_dataset("q_value", data=q_from_data, chunks=(100,),
                              dtype="float32", overwrite=True, compressor=compressor)
     zarr_data.create_dataset("advantage", data=adv_arr, chunks=(100,),
