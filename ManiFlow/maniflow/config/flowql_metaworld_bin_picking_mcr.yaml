@@ -1,0 +1,155 @@
+defaults:
+  - _self_
+
+name: train_flowql_metaworld_bin_picking_mcr
+task_name: bin-picking
+exp_name: "flowql_metaworld_bin_picking_mcr"
+
+horizon: 1
+n_obs_steps: 1
+n_action_steps: 1
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+
+policy:
+  _target_: maniflow.policy.mcr_flow_policy.MCRFlowPolicy
+  mcr_ckpt_path: ../robots-pretrain-robots/mcr_resnet50.pth
+  embedding_dim: 2048          # MCR ResNet50 output dim
+  action_dim: 4                # MetaWorld action dim
+  hidden_dim: 256
+  t_dim: 16
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_layers: 3
+  num_inference_steps: 10
+  sample_t_mode_flow: "uniform"
+  sample_target_t_mode: "relative"
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 256
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 1010
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 50
+  checkpoint_every: 200
+  val_every: 100
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  num_batches: 1000
+  max_grad_norm: 10.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: MetaWorld_bin_picking_mcr
+  resume: False
+  tags:
+    - ${logging.project}
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 3
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+# Critic uses full_state (39-dim) — asymmetric, no image encoder in critic
+flowql:
+  enabled: True
+  eta: 2.0
+  alpha: 1.0
+  discount: 0.99
+  tau: 0.005
+  critic_lr: 3.0e-4
+  state_dim: 39          # full_state dim (robot + object state)
+  action_dim: 4          # MetaWorld action dim
+  critic_hidden_dim: 256
+  num_sample_steps: 6
+  grad_norm: 10
+  max_q_backup: false
+  reward_tune: "no"
+  lr_decay: true
+  warmup_epochs: 0
+
+task:
+  task_name: ${task_name}
+  dataset:
+    _target_: maniflow.dataset.adroit_image_dataset.AdroitImageDataset
+    # zarr_path: data/metaworld_bin-picking_expert_2d.zarr
+    zarr_path: ../runs/sb3_metaworld_sac/models_84/bin-picking/replay_buffer_t6200000.zarr
+    horizon: ${horizon}
+    pad_before: 0
+    pad_after: 0
+    seed: 42
+    val_ratio: 0.01
+    task_name: ${task_name}
+    use_img: false           # skip raw images — embeddings already precomputed
+    use_full_state: true     # 39-dim state for critic
+    use_rl_signals: true     # reward, done, next_full_state, next_state
+    use_embedding: true      # load img_embedding + next_img_embedding (2048-dim)
+  env_runner:
+    _target_: maniflow.env_runner.metaworld_runner_2d.MetaworldRunner2D
+    eval_episodes: 20
+    max_steps: 500
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    fps: 10
+    task_name: ${task_name}
+    render_size: 84
+    camera_name: "corner"
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
