@@ -50,6 +50,8 @@ class SB3MetaWorldStateEnv(gym.Env):
         episode_length: int = 200,
         seed: Optional[int] = None,
         grasp_reward_bonus: float = 0.5,
+        store_sim_states: bool = False,
+        sim_state_buffer_size: int = 0,
     ):
         super().__init__()
 
@@ -72,7 +74,21 @@ class SB3MetaWorldStateEnv(gym.Env):
         task_base = task_name.replace('-v2-goal-observable', '').replace('-v2', '')
         self.use_grasp_bonus = task_base in self.GRASP_TASKS
         self.grasp_reward_bonus = grasp_reward_bonus if self.use_grasp_bonus else 0.0
-        
+
+        # Ring buffers for sim-state-based image rendering 
+        self._store_sim_states = store_sim_states
+        self._sim_state_buffer_size = sim_state_buffer_size
+        _buf = sim_state_buffer_size if sim_state_buffer_size > 0 else 0
+        self._buf_pos = 0
+        self._sim_states      = [None] * _buf if store_sim_states else []
+        self._next_sim_states = [None] * _buf if store_sim_states else []
+        self._success_flags = np.zeros(_buf, dtype=np.float32) if _buf > 0 else None
+        # agent_pos = [eef_pos(3), finger_right(3), finger_left(3)] stored per step
+        self._agent_pos_buf      = np.zeros((_buf, 9), dtype=np.float32) if _buf > 0 else None
+        self._next_agent_pos_buf = np.zeros((_buf, 9), dtype=np.float32) if _buf > 0 else None
+        self._store_agent_pos = _buf > 0
+        self._post_reset_robot_state: Optional[np.ndarray] = None  # cached after reset()
+
         self.cur_step = 0
         if seed is not None:
             self.seed(seed)
@@ -80,24 +96,55 @@ class SB3MetaWorldStateEnv(gym.Env):
     def reset(self):
         obs = self.env.reset()
         self.cur_step = 0
+        if self._store_agent_pos:
+            self._post_reset_robot_state = self._get_robot_state()
         return np.asarray(obs, dtype=np.float32)
 
+    def _get_robot_state(self) -> np.ndarray:
+        """[eef_pos(3), finger_right(3), finger_left(3)] — matches MetaWorldEnv2D.get_robot_state()."""
+        eef_pos = self.env.get_endeff_pos()
+        finger_right = self.env._get_site_pos('rightEndEffector')
+        finger_left  = self.env._get_site_pos('leftEndEffector')
+        return np.concatenate([eef_pos, finger_right, finger_left]).astype(np.float32)
+
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        pos = self._buf_pos
+
+        if self._store_sim_states:
+            self._sim_states[pos] = self.env.sim.get_state()
+        if self._store_agent_pos:
+            if self._post_reset_robot_state is not None:
+                self._agent_pos_buf[pos] = self._post_reset_robot_state
+                self._post_reset_robot_state = None
+            else:
+                self._agent_pos_buf[pos] = self._get_robot_state()
+
         obs, reward, done, info = self.env.step(action)
         self.cur_step += 1
         done = bool(done) or (self.cur_step >= self.episode_length)
-        
+
+        if self._store_sim_states:
+            self._next_sim_states[pos] = self.env.sim.get_state()
+        if self._store_agent_pos:
+            self._next_agent_pos_buf[pos] = self._get_robot_state()
+
         # Add grasp reward bonus for hard manipulation tasks
-        # This encourages the agent to actually close the gripper and grasp objects
         if self.use_grasp_bonus and self.grasp_reward_bonus > 0:
             grasp_success = info.get('grasp_success', False)
             grasp_reward = info.get('grasp_reward', 0.0)
             if grasp_success:
                 reward += self.grasp_reward_bonus
             elif isinstance(grasp_reward, (int, float)) and grasp_reward > 0.5:
-                # Partial bonus for good grasp attempt
                 reward += self.grasp_reward_bonus * 0.5 * grasp_reward
-        
+
+        info["success"] = bool(info.get("success", False))
+
+        if self._success_flags is not None:
+            self._success_flags[pos] = 1.0 if info["success"] else 0.0
+
+        if self._sim_state_buffer_size > 0:
+            self._buf_pos = (pos + 1) % self._sim_state_buffer_size
+
         return np.asarray(obs, dtype=np.float32), float(reward), done, info
 
     def seed(self, seed: Optional[int] = None):

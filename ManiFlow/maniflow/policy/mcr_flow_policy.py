@@ -40,7 +40,7 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
     - Critic   : still uses full_state (39-dim), not embeddings → asymmetric.
     """
 
-    is_embedding_policy = True   # signals workspace to use embedding branch
+    is_embedding_policy = True   
 
     def __init__(self,
                  mcr_ckpt_path: str,
@@ -53,7 +53,7 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
 
         self.embedding_bn = nn.BatchNorm1d(embedding_dim)
 
-        # Load frozen MCR — only used at inference
+        # Load frozen MCR 
         MCR_DIR = str(pathlib.Path(__file__).parent.parent.parent.parent
                       / 'robots-pretrain-robots')
         if MCR_DIR not in sys.path:
@@ -64,7 +64,7 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
             p.requires_grad = False
         self.mcr.eval()
 
-    # ── encoder (training path) ───────────────────────────────────────────────
+    # ── encoder ───────────────────────────────────────────────
 
     def obs_encoder(self, nobs: dict) -> torch.Tensor:
         """
@@ -109,11 +109,11 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
         """
         device, dtype = self.device, self.dtype
 
-        if 'img_embedding' in obs_dict:
-            embedding = obs_dict['img_embedding'][:, :self.n_obs_steps].to(device)
-        else:
-            img = obs_dict['image'][:, :self.n_obs_steps]   # (B, T, H, W, C)
-            embedding = self._encode_images(img)             # (B, T, 2048)
+        # if 'img_embedding' in obs_dict:
+        embedding = obs_dict['img_embedding'][:, :self.n_obs_steps].to(device)
+        # else:
+        #     img = obs_dict['image'][:, :self.n_obs_steps]   # (B, T, H, W, C)
+        #     embedding = self._encode_images(img)             # (B, T, 2048)
 
         B, T, D = embedding.shape
         embedding = self.embedding_bn(embedding.reshape(B * T, D)).reshape(B, T, D)

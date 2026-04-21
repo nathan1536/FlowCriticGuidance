@@ -2,26 +2,13 @@
 """
 Single-task SAC training on MetaWorld using vendored Stable-Baselines3.
 
-SAC (Soft Actor-Critic) benefits over PPO for critic/data collection:
-- Off-policy: learns from diverse replay buffer data
-- Entropy-maximizing: explores more of the action space
-- Built-in twin Q-critics: better value estimation
-- Better data diversity for downstream IQL/ACGD critic training
-
-Includes optional auxiliary Q(s,a) critic training (same as PPO script)
-with contrastive ranking, expert data mixing, and TD learning.
-
 Example:
   # Basic SAC training
   python scripts/train_sac_metaworld.py --task reach --total-timesteps 1000000
 
-  # With auxiliary Q-critic and tensorboard
+  # Save replay buffer (with images) once success >= 80%
   python scripts/train_sac_metaworld.py --task pick-place --total-timesteps 2000000 \
-      --train-q-critic --tensorboard
-
-  # With expert data mixing for Q-critic
-  python scripts/train_sac_metaworld.py --task pick-place --total-timesteps 2000000 \
-      --train-q-critic --expert-data-path ManiFlow/data --tensorboard
+      --save-replay-buffer --save-rb-at-success 0.8
 """
 
 import argparse
@@ -29,37 +16,228 @@ import os
 import sys
 from pathlib import Path
 import importlib.util
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 
-def _acgd_qcritic_state_action_dims(obs_space, act_space) -> tuple:
-    """
-    Infer (state_dim, action_dim) for a simple MLP Q(s,a) critic.
-    Only supports flat Box observations and Box actions (MetaWorld).
-    """
-    obs_shape = getattr(obs_space, "shape", None)
-    act_shape = getattr(act_space, "shape", None)
-    if obs_shape is None or act_shape is None or len(obs_shape) != 1 or len(act_shape) != 1:
-        raise ValueError(f"Unsupported spaces for Q-critic: obs_shape={obs_shape} act_shape={act_shape}")
-    return int(obs_shape[0]), int(act_shape[0])
+METAWORLD_CAMERAS = {
+    "default": "corner2",
+}
 
 
-def _build_acgd_qcritic(state_dim: int, action_dim: int, hidden_dim: int):
+def _save_replay_buffer_to_zarr(
+    model,
+    task_key: str,
+    out_path: Path,
+    env=None,
+    image_size: int = 128,
+    camera_name: str = "",
+    device_id: int = 0,
+    save_last_n: int = 0,
+) -> None:
     """
-    Construct the Q(s,a) critic network.
-    Architecture must match build_qcritic() in workspace for loading.
+    Dump the SB3 SAC replay buffer to a ManiFlow-compatible zarr dataset.
+
+    Saves: full_state, state, action, reward, done, q_value, v_value, advantage,
+           episode_ends, episode_success.
+    If *env* has stored sim states, also renders and saves img + next_img.
     """
-    return nn.Sequential(
-        nn.Linear(state_dim + action_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, 1),
+    import zarr
+
+    replay_buffer = model.replay_buffer
+    buf_size = replay_buffer.size()
+    if buf_size == 0:
+        print("[ReplayBuffer] Buffer is empty, skipping save.")
+        return
+
+    if save_last_n > 0 and save_last_n < buf_size:
+        offset = buf_size - save_last_n
+        save_size = save_last_n
+        print(f"[ReplayBuffer] Saving last {save_last_n} of {buf_size} transitions")
+    else:
+        offset = 0
+        save_size = buf_size
+
+    device = model.device
+
+    buf_capacity = replay_buffer.buffer_size
+    if replay_buffer.full:
+        pos = replay_buffer.pos
+        chronological = np.concatenate([np.arange(pos, buf_capacity), np.arange(0, pos)])
+        idx = chronological[offset:]
+    else:
+        idx = np.arange(offset, buf_size)
+
+    obs_buf      = replay_buffer.observations[idx].squeeze(1)
+    next_obs_buf = replay_buffer.next_observations[idx].squeeze(1)
+    act_buf      = replay_buffer.actions[idx].squeeze(1)
+    rew_buf      = replay_buffer.rewards[idx].squeeze(1)
+    done_buf     = replay_buffer.dones[idx].squeeze(1)
+
+    full_state_arr      = obs_buf.astype(np.float32)
+    next_full_state_arr = next_obs_buf.astype(np.float32)
+    act_arr  = act_buf.astype(np.float32)
+    rew_arr  = rew_buf.astype(np.float32).ravel()
+    done_arr = done_buf.astype(np.float32).ravel()
+
+    # Reconstruct episode boundaries from done flags
+    done_indices = np.where(done_arr > 0.5)[0]
+    if len(done_indices) == 0:
+        episode_ends = np.array([save_size], dtype=np.int64)
+    else:
+        episode_ends = (done_indices + 1).astype(np.int64)
+        if episode_ends[-1] < save_size:
+            episode_ends = np.append(episode_ends, save_size)
+
+    # Compute Q(s,a), V(s), advantage using SAC twin critics
+    print(f"[ReplayBuffer] Computing Q/V/advantage for {save_size} transitions ...")
+    qf0 = model.critic.qf0
+    qf1 = model.critic.qf1
+    qf0.eval(); qf1.eval()
+
+    q_value_arr = np.zeros(save_size, dtype=np.float32)
+    v_value_arr = np.zeros(save_size, dtype=np.float32)
+
+    batch = 4096
+    with torch.no_grad():
+        for start in range(0, save_size, batch):
+            end = min(start + batch, save_size)
+            s_t = torch.FloatTensor(full_state_arr[start:end]).to(device)
+            a_t = torch.FloatTensor(act_arr[start:end]).to(device)
+            sa  = torch.cat([s_t, a_t], dim=-1)
+            q_value_arr[start:end] = torch.min(qf0(sa), qf1(sa)).squeeze(-1).cpu().numpy()
+            pi_a, _ = model.actor.action_log_prob(s_t)
+            sa_pi = torch.cat([s_t, pi_a], dim=-1)
+            v_value_arr[start:end] = torch.min(qf0(sa_pi), qf1(sa_pi)).squeeze(-1).cpu().numpy()
+
+    adv_arr = q_value_arr - v_value_arr
+
+    if out_path.exists():
+        import shutil
+        shutil.rmtree(out_path)
+        print(f"[ReplayBuffer] Removed existing {out_path}")
+
+    zarr_root = zarr.group(str(out_path))
+    zarr_data = zarr_root.create_group("data")
+    zarr_meta = zarr_root.create_group("meta")
+    compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
+
+    def _save(name, data, chunks=None, dtype=None):
+        dtype = dtype or data.dtype
+        if chunks is None:
+            chunks = (min(100, len(data)),) + data.shape[1:]
+        zarr_data.create_dataset(
+            name, data=data, chunks=chunks, dtype=str(dtype),
+            overwrite=True, compressor=compressor,
+        )
+
+    # agent_pos = [eef_pos(3), finger_right(3), finger_left(3)] stored per step in env ring buffer
+    if env is None or getattr(env, "_agent_pos_buf", None) is None:
+        raise RuntimeError(
+            "agent_pos ring buffer not available. "
+            "Make sure --n-envs 1 and store_sim_states=True so SB3MetaWorldStateEnv "
+            "captures robot state each step."
+        )
+    state_arr      = env._agent_pos_buf[idx].astype(np.float32)
+    next_state_arr = env._next_agent_pos_buf[idx].astype(np.float32)
+
+    _save("full_state", full_state_arr)
+    _save("next_full_state", next_full_state_arr)
+    _save("state", state_arr)
+    _save("next_state", next_state_arr)
+    _save("action", act_arr)
+    _save("reward",    rew_arr,    chunks=(min(100, save_size),))
+    _save("done",      done_arr,   chunks=(min(100, save_size),))
+    _save("q_value",   q_value_arr, chunks=(min(100, save_size),))
+    _save("v_value",   v_value_arr, chunks=(min(100, save_size),))
+    _save("advantage", adv_arr,    chunks=(min(100, save_size),))
+
+    # Per-episode success
+    episode_success_arr = np.zeros(save_size, dtype=np.float32)
+    if env is not None and getattr(env, "_success_flags", None) is not None:
+        step_success = env._success_flags[idx].astype(np.float32)
+        ep_starts = np.concatenate([[0], episode_ends[:-1]])
+        for ep_i, (s, e) in enumerate(zip(ep_starts, episode_ends)):
+            ep_succeeded = float(step_success[s:e].max() > 0.5)
+            episode_success_arr[s:e] = ep_succeeded
+        n_succ = int((episode_success_arr[ep_starts.astype(int)] > 0.5).sum())
+        print(f"[ReplayBuffer] Episode success: {n_succ}/{len(episode_ends)} episodes succeeded")
+    else:
+        print("[ReplayBuffer] No per-step success data; episode_success will be all zeros")
+    _save("episode_success", episode_success_arr, chunks=(min(100, save_size),))
+
+    # Render images from stored sim states
+    has_images = False
+    if env is not None and getattr(env, "_store_sim_states", False):
+        cam = camera_name or METAWORLD_CAMERAS["default"]
+        print(f"[ReplayBuffer] Rendering {save_size} images ({image_size}x{image_size}, camera={cam}) ...")
+        mj_env = env.env  # underlying MetaWorld environment (has .sim)
+        img_shape = (image_size, image_size, 3)
+        img_dataset = zarr_data.create_dataset(
+            "img", shape=(save_size, *img_shape),
+            chunks=(100, *img_shape), dtype="uint8", overwrite=True, compressor=compressor,
+        )
+        next_img_dataset = zarr_data.create_dataset(
+            "next_img", shape=(save_size, *img_shape),
+            chunks=(100, *img_shape), dtype="uint8", overwrite=True, compressor=compressor,
+        )
+
+        RENDER_BATCH = 1000
+        img_batch      = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
+        next_img_batch = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
+        batch_idx  = 0
+        batch_start = 0
+
+        def _render_sim_state(state):
+            if state is None:
+                return np.zeros(img_shape, dtype=np.uint8)
+            mj_env.sim.set_state(state)
+            mj_env.sim.forward()
+            return mj_env.sim.render(
+                width=image_size, height=image_size,
+                mode="offscreen", camera_name=cam, device_id=device_id,
+            ).astype(np.uint8)
+
+        for local_idx, buf_idx in enumerate(idx):
+            img_batch[batch_idx]      = _render_sim_state(env._sim_states[buf_idx])
+            next_img_batch[batch_idx] = _render_sim_state(env._next_sim_states[buf_idx])
+            batch_idx += 1
+            if batch_idx == RENDER_BATCH:
+                img_dataset[batch_start:batch_start + batch_idx]      = img_batch[:batch_idx]
+                next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
+                batch_start += batch_idx
+                batch_idx = 0
+            if (local_idx + 1) % 50000 == 0:
+                print(f"  rendered {local_idx + 1}/{save_size} ...")
+        if batch_idx > 0:
+            img_dataset[batch_start:batch_start + batch_idx]      = img_batch[:batch_idx]
+            next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
+        has_images = True
+
+    zarr_meta.create_dataset(
+        "episode_ends", data=episode_ends,
+        dtype="int64", overwrite=True, compressor=compressor,
     )
+
+    n_episodes = len(episode_ends)
+    ep_starts = np.concatenate([[0], episode_ends[:-1]])
+    ep_lens = episode_ends - ep_starts
+    ep_rewards = np.array([rew_arr[s:e].sum() for s, e in zip(ep_starts, episode_ends)])
+
+    print(f"\n[ReplayBuffer -> Zarr] Saved to {out_path}")
+    print(f"  transitions : {save_size}" + (f" (last {save_last_n} of {buf_size})" if offset > 0 else ""))
+    print(f"  episodes    : {n_episodes}")
+    if has_images:
+        print(f"  images      : ({save_size}, {image_size}, {image_size}, 3) [img + next_img]")
+    print(f"  ep lengths  : mean={ep_lens.mean():.1f} min={ep_lens.min()} max={ep_lens.max()}")
+    print(f"  ep rewards  : mean={ep_rewards.mean():.1f} std={ep_rewards.std():.1f}")
+    print(f"  Q(s,a)      : mean={q_value_arr.mean():.1f} std={q_value_arr.std():.1f}")
+    print(f"  V(s)        : mean={v_value_arr.mean():.1f} std={v_value_arr.std():.1f}")
+    print(f"  Advantage   : mean={adv_arr.mean():.3f} std={adv_arr.std():.3f} "
+          f"positive={100*(adv_arr>0).mean():.1f}%")
+    print(f"  Shapes: full_state={full_state_arr.shape} state={state_arr.shape} action={act_arr.shape}")
 
 
 def _save_sac_twin_critic(model, save_path: Path) -> None:
@@ -158,28 +336,22 @@ def parse_args():
     p.add_argument("--net-arch", type=int, nargs="+", default=[256, 256],
                    help="Hidden layer sizes for actor and critic (e.g., 256 256).")
 
-    # ── Auxiliary Q-critic training ──
-    p.add_argument("--train-q-critic", action="store_true",
-                   help="Train an auxiliary Q(s,a) critic alongside SAC.")
-    p.add_argument("--q-critic-lr", type=float, default=3e-4)
-    p.add_argument("--q-critic-hidden-dim", type=int, default=256)
-    p.add_argument("--q-critic-save-name", type=str, default="expert_critic_q.pt")
-    p.add_argument("--q-critic-train-freq", type=int, default=2000,
-                   help="Train auxiliary Q-critic every N env steps.")
-    p.add_argument("--q-critic-epochs", type=int, default=20,
-                   help="Gradient epochs per Q-critic training round.")
-    p.add_argument("--q-critic-neg-samples", type=int, default=6)
-    p.add_argument("--q-critic-neg-noise-std", type=float, default=0.3)
-    p.add_argument("--q-critic-random-neg-ratio", type=float, default=0.5)
-    p.add_argument("--q-critic-mini-batch-size", type=int, default=2048)
-    p.add_argument("--q-critic-margin", type=float, default=5.0)
-    p.add_argument("--q-critic-margin-weight", type=float, default=5.0)
-
-    # ── Expert data mixing ──
-    p.add_argument("--expert-data-path", type=str, default="ManiFlow/data",
-                   help="Path to directory containing metaworld_<task>_expert.zarr files.")
-    p.add_argument("--q-critic-expert-ratio", type=float, default=0.3,
-                   help="Fraction of Q-critic mini-batch from expert data (0.3 = 30%%).")
+    # ── Replay buffer saving ──
+    p.add_argument("--save-replay-buffer", action="store_true",
+                   help="Save the SAC replay buffer to zarr at checkpoints.")
+    p.add_argument("--save-last-n", type=int, default=0,
+                   help="Only save the last N transitions to zarr (0 = save all).")
+    p.add_argument("--no-images", action="store_true",
+                   help="Skip image rendering when saving replay buffer to zarr.")
+    p.add_argument("--save-rb-at-success", type=float, default=0.8,
+                   help="Save replay buffer (with images) once when success rate first "
+                        "reaches this threshold. 0 = save at every best-model checkpoint.")
+    p.add_argument("--image-size", type=int, default=128,
+                   help="Image size for replay buffer rendering.")
+    p.add_argument("--camera", type=str, default="",
+                   help="MuJoCo camera name (empty = task default 'corner2').")
+    p.add_argument("--device-id", type=int, default=0,
+                   help="MuJoCo render device id (GPU index).")
 
     return p.parse_args()
 
@@ -207,7 +379,7 @@ def main():
     SB3MetaWorldStateEnv = env_mod.SB3MetaWorldStateEnv
 
     from stable_baselines3 import SAC
-    from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+    from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
@@ -225,9 +397,14 @@ def main():
             print("[Warn] --tensorboard set but tensorboard is not installed; disabling.")
 
     # ── Environment setup ──
-    def make_env(rank: int):
+    def make_env(rank: int, store_sim_states: bool = False, buf_size: int = 0):
         def _init():
-            env = SB3MetaWorldStateEnv(task_name=args.task, seed=args.seed + rank)
+            env = SB3MetaWorldStateEnv(
+                task_name=args.task,
+                seed=args.seed + rank,
+                store_sim_states=store_sim_states,
+                sim_state_buffer_size=buf_size,
+            )
             if args.monitor_dir:
                 monitor_root = repo_root / args.monitor_dir / args.task
                 os.makedirs(monitor_root, exist_ok=True)
@@ -236,8 +413,14 @@ def main():
         return _init
 
     if args.n_envs <= 1:
-        vec_env = DummyVecEnv([make_env(0)])
+        store_states = args.save_replay_buffer and not args.no_images
+        # sim_state_buffer_size > 0 activates agent_pos + sim-state buffering
+        rb_buf_size = args.buffer_size if args.save_replay_buffer else 0
+        vec_env = DummyVecEnv([make_env(0, store_sim_states=store_states, buf_size=rb_buf_size)])
     else:
+        # SubprocVecEnv doesn't expose inner env objects; replay buffer saving requires n_envs=1.
+        if args.save_replay_buffer:
+            raise RuntimeError("--save-replay-buffer requires --n-envs 1")
         vec_env = SubprocVecEnv([make_env(i) for i in range(args.n_envs)])
     vec_env = VecMonitor(vec_env)
 
@@ -262,8 +445,13 @@ def main():
             n_eval_episodes: int,
             save_dir: Path,
             best_metric: str = "success_rate",
-            q_critic: Optional[nn.Module] = None,
-            q_critic_name: str = "expert_critic_q.pt",
+            save_replay_buffer: bool = False,
+            task_key: str = "",
+            image_size: int = 128,
+            camera_name: str = "",
+            device_id: int = 0,
+            save_last_n: int = 0,
+            save_rb_at_success: float = 0.8,
             verbose: int = 1,
         ):
             super().__init__(verbose=verbose)
@@ -274,13 +462,53 @@ def main():
             self.best_metric = best_metric
             self.best_value = -float("inf")
             self.last_eval_t = 0
-            self.q_critic = q_critic
-            self.q_critic_name = q_critic_name
+            self.save_replay_buffer = save_replay_buffer
+            self.task_key = task_key
+            self.image_size = image_size
+            self.camera_name = camera_name
+            self.device_id = device_id
+            self.save_last_n = save_last_n
+            self.save_rb_at_success = save_rb_at_success
+            self._rb_saved = False
             self._saved_85_count = 0
             self._max_85_saves = 5
 
         def _init_callback(self) -> None:
             os.makedirs(self.save_dir, exist_ok=True)
+
+        def _get_training_env(self):
+            """Unwrap VecMonitor -> DummyVecEnv -> [Monitor ->] SB3MetaWorldStateEnv."""
+            raw = self.model.env.venv.envs[0]
+            if hasattr(raw, "env") and hasattr(raw.env, "_store_sim_states"):
+                return raw.env
+            return raw
+
+        def _save_rb(self, tag: str, success_rate: float = 0.0) -> None:
+            if not self.save_replay_buffer:
+                return
+            train_env = self._get_training_env()
+            has_images = getattr(train_env, "_store_sim_states", False)
+
+            # With images: only save once when success threshold is first reached.
+            # Without images: save unconditionally.
+            if has_images and self.save_rb_at_success > 0:
+                if self._rb_saved or success_rate < self.save_rb_at_success:
+                    return
+                self._rb_saved = True
+                print(f"[ReplayBuffer] Success {success_rate:.2f} >= {self.save_rb_at_success:.2f}, "
+                      f"saving replay buffer with images (one-time).")
+
+            rb_path = self.save_dir / f"replay_buffer_{tag}.zarr"
+            _save_replay_buffer_to_zarr(
+                model=self.model,
+                task_key=self.task_key,
+                out_path=rb_path,
+                env=train_env,
+                image_size=self.image_size,
+                camera_name=self.camera_name,
+                device_id=self.device_id,
+                save_last_n=self.save_last_n,
+            )
 
         def _evaluate(self):
             episode_rewards = []
@@ -322,10 +550,6 @@ def main():
                     print(f"  [Diverse 85%] #{self._saved_85_count}/{self._max_85_saves} "
                           f"success={success_rate:.2f} → {ckpt_path.name}")
 
-            # Share success rate with Q-critic callback
-            if q_cb is not None:
-                q_cb._last_eval_success_rate = success_rate
-
             if self.verbose:
                 print(
                     f"[Eval] t={self.num_timesteps} episodes={self.n_eval_episodes} "
@@ -341,13 +565,8 @@ def main():
                 self.best_value = float(value)
                 best_path = self.save_dir / "best_model.zip"
                 self.model.save(str(best_path))
-                # Save SAC's twin Q-critics as min(Q1,Q2)
                 _save_sac_twin_critic(self.model, self.save_dir / "sac_twin_critic_q.pt")
-                if self.q_critic is not None:
-                    q_path = self.save_dir / self.q_critic_name
-                    torch.save(self.q_critic.state_dict(), str(q_path))
-                    if self.verbose:
-                        print(f"  [Best] Q-Critic → {q_path}")
+                self._save_rb("best", success_rate)
                 if self.verbose:
                     print(f"  [Best] metric={self.best_metric} value={value:.3f} → {best_path}")
 
@@ -378,355 +597,22 @@ def main():
 
             return True
 
-    # ══════════════════════════════════════════════════════════════════
-    # Auxiliary Q(s,a) Critic Callback (adapted for SAC replay buffer)
-    #
-    # SAC already has twin Q-critics internally. This trains a SEPARATE
-    # simple MLP Q-critic in the format expected by ACGD/IQL pipeline.
-    # It samples transitions from SAC's replay buffer for training.
-    # ══════════════════════════════════════════════════════════════════
-    class TrainQCriticSACCallback(BaseCallback):
-        """
-        Auxiliary Q(s,a) critic trained alongside SAC.
-        Samples from SAC's replay buffer (off-policy data) for training.
-        """
-
-        def __init__(
-            self,
-            q_critic: nn.Module,
-            q_optimizer: torch.optim.Optimizer,
-            train_freq: int = 2000,
-            q_epochs: int = 20,
-            neg_samples: int = 6,
-            neg_noise_std: float = 0.3,
-            random_neg_ratio: float = 0.5,
-            mini_batch_size: int = 2048,
-            margin: float = 5.0,
-            margin_weight: float = 5.0,
-            gamma: float = 0.99,
-            tau: float = 0.005,
-            expert_data_path: Optional[str] = None,
-            task_name: Optional[str] = None,
-            expert_ratio: float = 0.3,
-            save_dir: Optional[Path] = None,
-            verbose: int = 0,
-        ):
-            super().__init__(verbose=verbose)
-            self.q_critic = q_critic
-            self.q_optimizer = q_optimizer
-            self.train_freq = int(train_freq)
-            self.q_epochs = int(q_epochs)
-            self.neg_samples = int(neg_samples)
-            self.neg_noise_std = float(neg_noise_std)
-            self.random_neg_ratio = float(random_neg_ratio)
-            self.mini_batch_size = int(mini_batch_size)
-            self.margin = float(margin)
-            self.margin_weight = float(margin_weight)
-            self.gamma = float(gamma)
-            self.tau = float(tau)
-            self.expert_ratio = float(expert_ratio)
-            self.mse_fn = nn.MSELoss()
-            self.rank_fn = nn.MarginRankingLoss(margin=self.margin)
-
-            # Target network
-            import copy
-            self.q_target = copy.deepcopy(q_critic)
-            self.q_target.requires_grad_(False)
-
-            # Best-critic tracking
-            self.save_dir = save_dir
-            self._best_q_gap_vs_noisy = -float("inf")
-            self._last_eval_success_rate = 0.0
-            self._last_train_t = 0
-            self._train_count = 0
-
-            # Expert data
-            self._expert_obs = None
-            self._expert_actions = None
-            if expert_data_path and task_name:
-                self._load_expert_data(expert_data_path, task_name)
-
-        def _load_expert_data(self, data_path: str, task_name: str):
-            """Load full_state and action from the expert zarr dataset."""
-            import zarr
-            zarr_path = Path(data_path) / f"metaworld_{task_name}_expert.zarr"
-            if not zarr_path.exists():
-                print(f"[Q-Critic] WARNING: Expert zarr not found at {zarr_path}. "
-                      f"Critic trains on SAC replay data only.")
-                return
-            root = zarr.open(str(zarr_path), mode="r")
-            full_state = np.array(root["data"]["full_state"])
-            action = np.array(root["data"]["action"])
-            self._expert_obs = torch.tensor(full_state, dtype=torch.float32)
-            self._expert_actions = torch.tensor(action, dtype=torch.float32)
-            print(
-                f"[Q-Critic] Loaded expert data: {full_state.shape[0]} steps from {zarr_path}\n"
-                f"           state_dim={full_state.shape[1]}, action_dim={action.shape[1]}"
-            )
-
-        def _soft_update_target(self):
-            for p_target, p in zip(self.q_target.parameters(), self.q_critic.parameters()):
-                p_target.data.mul_(1.0 - self.tau).add_(p.data * self.tau)
-
-        def _on_step(self) -> bool:
-            # Only train periodically and after SAC has started learning
-            if (self.num_timesteps - self._last_train_t) < self.train_freq:
-                return True
-
-            replay_buffer = self.model.replay_buffer
-            if replay_buffer.size() < self.mini_batch_size:
-                return True
-
-            self._last_train_t = int(self.num_timesteps)
-            self._train_count += 1
-            device = self.model.device
-
-            # Move expert data to device
-            has_expert = self._expert_obs is not None
-            if has_expert:
-                expert_obs_dev = self._expert_obs.to(device)
-                expert_act_dev = self._expert_actions.to(device)
-                n_expert = expert_obs_dev.shape[0]
-
-            # ── Sample from SAC replay buffer for training ──
-            self.q_critic.train()
-            epoch_td_sum = 0.0
-            epoch_rank_sum = 0.0
-            epoch_expert_rank_sum = 0.0
-            total_batches = 0
-
-            # How many transitions to use per training round
-            n_train_samples = min(replay_buffer.size(), 50_000)
-
-            for _ in range(max(1, self.q_epochs)):
-                # Sample a large batch from SAC's replay buffer
-                replay_data = replay_buffer.sample(
-                    min(self.mini_batch_size, n_train_samples)
-                )
-
-                b_obs = replay_data.observations
-                b_act = replay_data.actions
-                b_next_obs = replay_data.next_observations
-                b_rewards = replay_data.rewards
-                b_dones = replay_data.dones
-                bs = b_obs.shape[0]
-                act_dim = b_act.shape[1]
-
-                # ── TD target using target network ──
-                with torch.no_grad():
-                    # Use SAC's actor to get next actions for TD target
-                    next_actions, _ = self.model.actor.action_log_prob(b_next_obs)
-                    next_sa = torch.cat([b_next_obs, next_actions], dim=-1)
-                    q_next = self.q_target(next_sa)
-                    td_target = b_rewards + self.gamma * (1.0 - b_dones) * q_next
-
-                # Q(s, a)
-                sa = torch.cat([b_obs, b_act], dim=-1)
-                q_pred = self.q_critic(sa)
-                loss_td = self.mse_fn(q_pred, td_target)
-
-                # ── Margin ranking loss (contrastive) ──
-                loss_rank = torch.tensor(0.0, device=device)
-                if self.neg_samples > 0:
-                    n_neg = min(bs, 256)
-                    neg_idx = torch.randint(0, bs, (n_neg,), device=device)
-
-                    n_noisy_neg = int(n_neg * (1.0 - self.random_neg_ratio))
-                    n_rand_neg = n_neg - n_noisy_neg
-
-                    neg_actions = torch.empty(n_neg, act_dim, device=device)
-                    if n_noisy_neg > 0:
-                        neg_actions[:n_noisy_neg] = b_act[neg_idx[:n_noisy_neg]] + \
-                            torch.randn(n_noisy_neg, act_dim, device=device) * self.neg_noise_std
-                    if n_rand_neg > 0:
-                        neg_actions[n_noisy_neg:] = torch.rand(n_rand_neg, act_dim, device=device) * 2 - 1
-
-                    neg_sa = torch.cat([b_obs[neg_idx], neg_actions], dim=-1)
-                    q_neg = self.q_critic(neg_sa)
-
-                    pos_sample = q_pred[neg_idx]
-                    target = torch.ones(n_neg, device=device)
-                    loss_rank = self.rank_fn(
-                        pos_sample.squeeze(-1), q_neg.squeeze(-1), target
-                    )
-
-                # ── Expert ranking loss ──
-                loss_expert_rank = torch.tensor(0.0, device=device)
-                if has_expert and self.neg_samples > 0:
-                    n_exp_batch = max(int(bs * self.expert_ratio), 32)
-                    exp_idx = torch.randint(0, n_expert, (n_exp_batch,), device=device)
-                    exp_obs = expert_obs_dev[exp_idx]
-                    exp_act = expert_act_dev[exp_idx]
-
-                    exp_sa = torch.cat([exp_obs, exp_act], dim=-1)
-                    q_exp_pos = self.q_critic(exp_sa)
-
-                    n_exp_noisy = int(n_exp_batch * (1.0 - self.random_neg_ratio))
-                    n_exp_rand = n_exp_batch - n_exp_noisy
-
-                    exp_neg_actions = torch.empty(n_exp_batch, act_dim, device=device)
-                    if n_exp_noisy > 0:
-                        exp_neg_actions[:n_exp_noisy] = exp_act[:n_exp_noisy] + \
-                            torch.randn(n_exp_noisy, act_dim, device=device) * self.neg_noise_std
-                    if n_exp_rand > 0:
-                        exp_neg_actions[n_exp_noisy:] = torch.rand(n_exp_rand, act_dim, device=device) * 2 - 1
-
-                    exp_neg_sa = torch.cat([exp_obs, exp_neg_actions], dim=-1)
-                    q_exp_neg = self.q_critic(exp_neg_sa)
-
-                    exp_target = torch.ones(n_exp_batch, device=device)
-                    loss_expert_rank = self.rank_fn(
-                        q_exp_pos.squeeze(-1), q_exp_neg.squeeze(-1), exp_target
-                    )
-
-                loss = (loss_td
-                        + self.margin_weight * loss_rank
-                        + self.margin_weight * loss_expert_rank)
-
-                self.q_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                self.q_optimizer.step()
-
-                epoch_td_sum += loss_td.item()
-                epoch_rank_sum += loss_rank.item()
-                epoch_expert_rank_sum += loss_expert_rank.item()
-                total_batches += 1
-
-            # Soft-update target network
-            self._soft_update_target()
-
-            avg_td = epoch_td_sum / max(total_batches, 1)
-            avg_rank = epoch_rank_sum / max(total_batches, 1)
-            avg_expert_rank = epoch_expert_rank_sum / max(total_batches, 1)
-
-            # ── Diagnostics ──
-            n_diag = min(200, replay_buffer.size())
-            diag_data = replay_buffer.sample(n_diag)
-            diag_obs = diag_data.observations
-            diag_act = diag_data.actions
-            act_dim = diag_act.shape[1]
-
-            with torch.no_grad():
-                q_onpol = self.q_critic(
-                    torch.cat([diag_obs, diag_act], dim=-1)
-                ).mean().item()
-                q_rand = self.q_critic(
-                    torch.cat([diag_obs, torch.rand(n_diag, act_dim, device=device) * 2 - 1], dim=-1)
-                ).mean().item()
-                q_noisy = self.q_critic(
-                    torch.cat([diag_obs, diag_act + torch.randn(n_diag, act_dim, device=device) * 0.3], dim=-1)
-                ).mean().item()
-
-            q_gap_vs_noisy = q_onpol - q_noisy
-            q_gap_vs_random = q_onpol - q_rand
-
-            self.logger.record("q_critic/td_loss", avg_td)
-            self.logger.record("q_critic/rank_loss", avg_rank)
-            self.logger.record("q_critic/expert_rank_loss", avg_expert_rank)
-            self.logger.record("q_critic/q_onpolicy", q_onpol)
-            self.logger.record("q_critic/q_random_action", q_rand)
-            self.logger.record("q_critic/q_noisy_action", q_noisy)
-            self.logger.record("q_critic/q_gap_vs_random", q_gap_vs_random)
-            self.logger.record("q_critic/q_gap_vs_noisy", q_gap_vs_noisy)
-            self.logger.record("q_critic/replay_size", replay_buffer.size())
-            self.logger.record("q_critic/train_count", self._train_count)
-
-            # Expert diagnostics
-            exp_gap_vs_noisy = 0.0
-            if has_expert:
-                n_exp_diag = min(200, n_expert)
-                with torch.no_grad():
-                    eidx = torch.randint(0, n_expert, (n_exp_diag,), device=device)
-                    e_obs = expert_obs_dev[eidx]
-                    e_act = expert_act_dev[eidx]
-                    exp_q_expert = self.q_critic(
-                        torch.cat([e_obs, e_act], dim=-1)
-                    ).mean().item()
-                    exp_q_noisy = self.q_critic(
-                        torch.cat([e_obs, e_act + torch.randn(n_exp_diag, act_dim, device=device) * 0.3], dim=-1)
-                    ).mean().item()
-                    exp_q_rand = self.q_critic(
-                        torch.cat([e_obs, torch.rand(n_exp_diag, act_dim, device=device) * 2 - 1], dim=-1)
-                    ).mean().item()
-
-                exp_gap_vs_noisy = exp_q_expert - exp_q_noisy
-                exp_gap_vs_random = exp_q_expert - exp_q_rand
-
-                self.logger.record("q_critic/expert_q_expert_action", exp_q_expert)
-                self.logger.record("q_critic/expert_q_noisy_action", exp_q_noisy)
-                self.logger.record("q_critic/expert_q_random_action", exp_q_rand)
-                self.logger.record("q_critic/expert_gap_vs_noisy", exp_gap_vs_noisy)
-                self.logger.record("q_critic/expert_gap_vs_random", exp_gap_vs_random)
-
-            # Save best critic
-            save_gap = exp_gap_vs_noisy if has_expert else q_gap_vs_noisy
-            if self.save_dir is not None and save_gap > self._best_q_gap_vs_noisy:
-                self._best_q_gap_vs_noisy = save_gap
-                best_path = self.save_dir / "best_critic_quality_q.pt"
-                torch.save(self.q_critic.state_dict(), str(best_path))
-                self.logger.record("q_critic/best_q_gap_vs_noisy", save_gap)
-
-            if self._train_count % 10 == 0:
-                expert_str = ""
-                if has_expert:
-                    expert_str = (
-                        f" | EXP: Q(exp)={exp_q_expert:.1f} Q(noisy)={exp_q_noisy:.1f} "
-                        f"Q(rand)={exp_q_rand:.1f} gap={exp_gap_vs_noisy:.3f}"
-                    )
-                print(
-                    f"[Q-Critic] t={self.num_timesteps} round={self._train_count} "
-                    f"td={avg_td:.4f} rank={avg_rank:.4f} exp_rank={avg_expert_rank:.4f} "
-                    f"SAC: Q(on)={q_onpol:.1f} Q(rand)={q_rand:.1f} gap={q_gap_vs_noisy:.3f}"
-                    f"{expert_str} "
-                    f"replay={replay_buffer.size()}"
-                )
-
-            return True
-
-    # ── Build Q-critic (optional) ──
-    q_cb = None
-    q_critic = None
-    if args.train_q_critic:
-        state_dim, action_dim = _acgd_qcritic_state_action_dims(
-            vec_env.observation_space, vec_env.action_space
-        )
-        q_critic = _build_acgd_qcritic(state_dim, action_dim, args.q_critic_hidden_dim)
-        q_optimizer = torch.optim.Adam(q_critic.parameters(), lr=args.q_critic_lr)
-        expert_data_path = str(repo_root / args.expert_data_path)
-        q_cb = TrainQCriticSACCallback(
-            q_critic=q_critic,
-            q_optimizer=q_optimizer,
-            train_freq=args.q_critic_train_freq,
-            q_epochs=args.q_critic_epochs,
-            neg_samples=args.q_critic_neg_samples,
-            neg_noise_std=args.q_critic_neg_noise_std,
-            random_neg_ratio=args.q_critic_random_neg_ratio,
-            mini_batch_size=args.q_critic_mini_batch_size,
-            margin=args.q_critic_margin,
-            margin_weight=args.q_critic_margin_weight,
-            gamma=args.gamma,
-            tau=args.tau,
-            expert_data_path=expert_data_path,
-            task_name=args.task,
-            expert_ratio=args.q_critic_expert_ratio,
-            save_dir=save_dir,
-            verbose=0,
-        )
-
     eval_cb = PeriodicEvalBestCallback(
         eval_env=eval_env,
         eval_freq=args.eval_freq,
         n_eval_episodes=args.eval_episodes,
         save_dir=save_dir,
         best_metric=args.best_metric,
-        q_critic=q_critic,
-        q_critic_name="best_expert_critic_q.pt",
+        save_replay_buffer=args.save_replay_buffer,
+        task_key=args.task,
+        image_size=args.image_size,
+        camera_name=args.camera,
+        device_id=args.device_id,
+        save_last_n=args.save_last_n,
+        save_rb_at_success=args.save_rb_at_success,
         verbose=1,
     )
-    callbacks = [eval_cb]
-    if q_cb is not None:
-        callbacks.append(q_cb)
-    callback = CallbackList(callbacks) if len(callbacks) > 1 else callbacks[0]
+    callback = eval_cb
 
     # ── Parse ent_coef ──
     ent_coef = args.ent_coef
@@ -773,16 +659,7 @@ def main():
     print(f"[SAC] Net arch: {args.net_arch}")
     print(f"[SAC] Ent coef: {ent_coef}")
     print(f"[SAC] Device: {model.device}")
-    if args.train_q_critic:
-        print(f"[SAC] Auxiliary Q-critic: ON (hidden_dim={args.q_critic_hidden_dim}, "
-              f"train_freq={args.q_critic_train_freq})")
     print()
-
-    # Move auxiliary Q-critic to same device
-    if q_critic is not None:
-        q_critic.to(model.device)
-        if q_cb is not None:
-            q_cb.q_target.to(model.device)
 
     # ── Train ──
     model.learn(
@@ -795,10 +672,6 @@ def main():
     model_path = save_dir / "sac_model.zip"
     model.save(str(model_path))
     _save_sac_twin_critic(model, save_dir / "sac_twin_critic_q.pt")
-    if args.train_q_critic and q_critic is not None:
-        q_path = save_dir / args.q_critic_save_name
-        torch.save(q_critic.state_dict(), str(q_path))
-        print(f"[Saved Q-Critic] {q_path}")
 
     # ── Final evaluation ──
     episode_rewards = []

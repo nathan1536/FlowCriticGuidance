@@ -85,12 +85,16 @@ class SB3AdroitStateEnv(gym.Env):
 
         self.reward_rescale_factor = REWARD_RESCALE[task_key] if reward_rescale else 1.0
 
-        # Sim state ring buffer for image rendering at replay buffer save time.
-        # Stays in sync with SB3's replay buffer (both increment once per step).
+        # Ring buffers — all share one position counter, in sync with SB3's replay buffer.
         self._store_sim_states = store_sim_states
         self._sim_state_buffer_size = sim_state_buffer_size
-        self._sim_states = [None] * sim_state_buffer_size if store_sim_states else []
-        self._sim_state_pos = 0
+        _buf = sim_state_buffer_size if sim_state_buffer_size > 0 else 0
+        self._buf_pos = 0
+
+        self._sim_states      = [None] * _buf if store_sim_states else []
+        self._next_sim_states = [None] * _buf if store_sim_states else []
+
+        self._success_flags = np.zeros(_buf, dtype=np.float32) if _buf > 0 else None
 
         self.cur_step = 0
         if seed is not None:
@@ -102,19 +106,29 @@ class SB3AdroitStateEnv(gym.Env):
         return np.asarray(obs, dtype=np.float32)
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        # Capture sim state BEFORE stepping (corresponds to current obs/replay entry)
+        pos = self._buf_pos
+
+        # Capture sim state BEFORE stepping
         if self._store_sim_states:
-            self._sim_states[self._sim_state_pos] = self.env.get_env_state()
-            self._sim_state_pos = (self._sim_state_pos + 1) % self._sim_state_buffer_size
+            self._sim_states[pos] = self.env.get_env_state()
 
         obs, reward, done, info = self.env.step(action)
         self.cur_step += 1
 
+        # Capture sim state AFTER stepping
+        if self._store_sim_states:
+            self._next_sim_states[pos] = self.env.get_env_state()
+
         reward = float(reward) * self.reward_rescale_factor
         done = bool(done) or (self.cur_step >= self.episode_length)
 
-        # Normalise success key: Adroit uses 'goal_achieved', SAC eval expects 'success'
         info["success"] = bool(info.get("goal_achieved", False))
+
+        if self._success_flags is not None:
+            self._success_flags[pos] = 1.0 if info["success"] else 0.0
+
+        if self._sim_state_buffer_size > 0:
+            self._buf_pos = (pos + 1) % self._sim_state_buffer_size
 
         return np.asarray(obs, dtype=np.float32), reward, done, info
 
