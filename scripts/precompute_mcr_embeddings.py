@@ -82,7 +82,7 @@ def main():
     # Open zarr in append mode
     z = zarr.open(args.zarr_path, mode='a')
     img_zarr      = z['data']['img']       # (N, H, W, C) uint8
-    # next_img_zarr = z['data']['next_img']  # (N, H, W, C) uint8
+    next_img_zarr = z['data']['next_img']  # (N, H, W, C) uint8
     N = img_zarr.shape[0]
     print(f'Zarr has {N} frames, image shape {img_zarr.shape[1:]}')
 
@@ -98,17 +98,17 @@ def main():
                                  chunks=(100, 2048), dtype='float32')
         print(f'  Saved img_embedding: {z["data"]["img_embedding"].shape}')
 
-    # # next_img_embedding
-    # if 'next_img_embedding' in z['data'] and not args.overwrite:
-    #     print('next_img_embedding already exists — skipping (use --overwrite to recompute)')
-    # else:
-    #     print('Encoding next_img...')
-    #     next_emb = encode_array(mcr, next_img_zarr, args.batch_size, device, desc='next_img')
-    #     if 'next_img_embedding' in z['data']:
-    #         del z['data']['next_img_embedding']
-    #     z['data'].create_dataset('next_img_embedding', data=next_emb,
-    #                              chunks=(100, 2048), dtype='float32')
-    #     print(f'  Saved next_img_embedding: {z["data"]["next_img_embedding"].shape}')
+    # next_img_embedding
+    if 'next_img_embedding' in z['data'] and not args.overwrite:
+        print('next_img_embedding already exists — skipping (use --overwrite to recompute)')
+    else:
+        print('Encoding next_img...')
+        next_emb = encode_array(mcr, next_img_zarr, args.batch_size, device, desc='next_img')
+        if 'next_img_embedding' in z['data']:
+            del z['data']['next_img_embedding']
+        z['data'].create_dataset('next_img_embedding', data=next_emb,
+                                 chunks=(100, 2048), dtype='float32')
+        print(f'  Saved next_img_embedding: {z["data"]["next_img_embedding"].shape}')
 
     print(z.tree())
 
