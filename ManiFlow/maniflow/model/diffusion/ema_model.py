@@ -83,7 +83,7 @@ class EMAModel:
                     ema_param.mul_(self.decay)
                     ema_param.add_(param.data.to(dtype=ema_param.dtype), alpha=1 - self.decay)
 
-            # Copy buffers (running_mean, running_var, num_batches_tracked, etc.)
+            # Copy buffers 
             for buf, ema_buf in zip(module.buffers(recurse=False), ema_module.buffers(recurse=False)):
                 ema_buf.copy_(buf.data)
 
