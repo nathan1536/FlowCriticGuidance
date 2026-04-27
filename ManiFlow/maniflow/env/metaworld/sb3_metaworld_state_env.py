@@ -75,13 +75,23 @@ class SB3MetaWorldStateEnv(gym.Env):
         self.use_grasp_bonus = task_base in self.GRASP_TASKS
         self.grasp_reward_bonus = grasp_reward_bonus if self.use_grasp_bonus else 0.0
 
-        # Ring buffers for sim-state-based image rendering 
+        # Ring buffers for sim-state-based image rendering
         self._store_sim_states = store_sim_states
         self._sim_state_buffer_size = sim_state_buffer_size
         _buf = sim_state_buffer_size if sim_state_buffer_size > 0 else 0
         self._buf_pos = 0
-        self._sim_states      = [None] * _buf if store_sim_states else []
-        self._next_sim_states = [None] * _buf if store_sim_states else []
+
+        if store_sim_states and _buf > 0:
+            nq = self.env.sim.model.nq
+            nv = self.env.sim.model.nv
+            self._sim_qpos      = np.zeros((_buf, nq), dtype=np.float64)
+            self._sim_qvel      = np.zeros((_buf, nv), dtype=np.float64)
+            self._next_sim_qpos = np.zeros((_buf, nq), dtype=np.float64)
+            self._next_sim_qvel = np.zeros((_buf, nv), dtype=np.float64)
+        else:
+            self._sim_qpos = self._sim_qvel = None
+            self._next_sim_qpos = self._next_sim_qvel = None
+
         self._success_flags = np.zeros(_buf, dtype=np.float32) if _buf > 0 else None
         # agent_pos = [eef_pos(3), finger_right(3), finger_left(3)] stored per step
         self._agent_pos_buf      = np.zeros((_buf, 9), dtype=np.float32) if _buf > 0 else None
@@ -111,7 +121,8 @@ class SB3MetaWorldStateEnv(gym.Env):
         pos = self._buf_pos
 
         if self._store_sim_states:
-            self._sim_states[pos] = self.env.sim.get_state()
+            self._sim_qpos[pos] = self.env.sim.data.qpos
+            self._sim_qvel[pos] = self.env.sim.data.qvel
         if self._store_agent_pos:
             if self._post_reset_robot_state is not None:
                 self._agent_pos_buf[pos] = self._post_reset_robot_state
@@ -124,7 +135,8 @@ class SB3MetaWorldStateEnv(gym.Env):
         done = bool(done) or (self.cur_step >= self.episode_length)
 
         if self._store_sim_states:
-            self._next_sim_states[pos] = self.env.sim.get_state()
+            self._next_sim_qpos[pos] = self.env.sim.data.qpos
+            self._next_sim_qvel[pos] = self.env.sim.data.qvel
         if self._store_agent_pos:
             self._next_agent_pos_buf[pos] = self._get_robot_state()
 

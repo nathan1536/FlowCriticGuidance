@@ -55,6 +55,7 @@ from maniflow.common.pytorch_util import dict_apply, optimizer_to
 from maniflow.model.diffusion.ema_model import EMAModel
 from maniflow.model.common.lr_scheduler import get_scheduler
 from maniflow.model.critic import TwinQCritic
+from maniflow.policy.drqv2_flow_policy import DrQv2FlowPolicy
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -160,20 +161,6 @@ class TrainFlowQLAdroitWorkspace:
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseDataset)
 
-        num_batches = cfg.training.get("num_batches", None)
-        if num_batches is not None:
-            total_samples = cfg.dataloader.batch_size * num_batches * cfg.training.num_epochs
-            sampler = RandomSampler(dataset, replacement=True, num_samples=total_samples)
-            dataloader_cfg = dict(cfg.dataloader)
-            dataloader_cfg.pop('shuffle', None)
-            train_dataloader = DataLoader(dataset, sampler=sampler, **dataloader_cfg)
-            train_dataloader_iter = iter(train_dataloader)
-            cprint(f"Using RandomSampler: {num_batches} batches/epoch, {total_samples} total samples", 'yellow')
-        else:
-            train_dataloader = DataLoader(dataset, **cfg.dataloader)
-            train_dataloader_iter = None
-        normalizer = dataset.get_normalizer()
-
         # Reward standardization 
         reward_tune = flowql_cfg.get("reward_tune", "normalize")
         if hasattr(dataset, 'has_rl_signals') and dataset.has_rl_signals and reward_tune != "no":
@@ -189,6 +176,21 @@ class TrainFlowQLAdroitWorkspace:
         cprint(f"Dataset Path: {dataset.zarr_path}", 'red')
         cprint(f"Number of training episodes: {dataset.train_episodes_num}", 'red')
         cprint(f"RL signals available: {getattr(dataset, 'has_rl_signals', False)}", 'red')
+
+        num_batches = cfg.training.get("num_batches", None)
+        if num_batches is not None:
+            total_samples = cfg.dataloader.batch_size * num_batches * cfg.training.num_epochs
+            sampler = RandomSampler(dataset, replacement=True, num_samples=total_samples)
+            dataloader_cfg = dict(cfg.dataloader)
+            dataloader_cfg.pop('shuffle', None)
+            train_dataloader = DataLoader(dataset, sampler=sampler, **dataloader_cfg)
+            train_dataloader_iter = iter(train_dataloader)
+            cprint(f"Using RandomSampler: {num_batches} batches/epoch, {total_samples} total samples", 'yellow')
+        else:
+            train_dataloader = DataLoader(dataset, **cfg.dataloader)
+            train_dataloader_iter = None
+        normalizer = dataset.get_normalizer()
+
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
@@ -236,6 +238,8 @@ class TrainFlowQLAdroitWorkspace:
             config=OmegaConf.to_container(cfg, resolve=True),
             **cfg.logging
         )
+
+        
         wandb.config.update({"output_dir": self.output_dir})
 
         # configure checkpoint
@@ -251,6 +255,7 @@ class TrainFlowQLAdroitWorkspace:
         self.critic.to(device)
         self.critic_target.to(device)
         optimizer_to(self.optimizer, device)
+        optimizer_to(self.critic_optimizer, device)
 
         train_sampling_batch = None
 
@@ -264,7 +269,7 @@ class TrainFlowQLAdroitWorkspace:
 
             t_data_start = time.time()
             if train_dataloader_iter is not None:
-                epoch_batches = [next(train_dataloader_iter) for _ in range(num_batches)]
+                epoch_batches = (next(train_dataloader_iter) for _ in range(num_batches))
                 epoch_iter = enumerate(epoch_batches)
             else:
                 epoch_iter = enumerate(train_dataloader)
@@ -300,14 +305,29 @@ class TrainFlowQLAdroitWorkspace:
                             ema_policy.eval()
 
                             next_obs_dict = {}
-                            if 'next_img' in batch['obs']:
-                                next_obs_dict['image'] = batch['obs']['next_img'][:, :self.model.n_obs_steps]
-                            else:
-                                next_obs_dict['image'] = batch['obs']['image'][:, :self.model.n_obs_steps]
-                            if 'next_state' in batch['obs']:
+                            # _is_image_policy = getattr(self.model, 'is_image_policy', False)
+                            # if _is_image_policy:
+                            #     # Image-based policy (DrQv2): encode next obs through CNN
+                            #     if 'next_img' in batch['obs']:
+                            #         next_obs_dict['image'] = batch['obs']['next_img'][:, :self.model.n_obs_steps]
+                            #     else:
+                            #         next_obs_dict['image'] = batch['obs']['image'][:, :self.model.n_obs_steps]
+                            #     if 'next_state' in batch['obs']:
+                            #         next_obs_dict['agent_pos'] = batch['obs']['next_state'][:, :self.model.n_obs_steps]
+                            #     else:
+                            #         next_obs_dict['agent_pos'] = batch['obs']['agent_pos'][:, :self.model.n_obs_steps]
+                            # else:
+                            #     # State-based policy (D4RL, MetaWorld state, Adroit state)
+                            #     next_obs_dict['full_state'] = batch['obs']['next_full_state'][:, :self.model.n_obs_steps]
+                            if getattr(self.model, 'is_embedding_policy', False):
+                                next_obs_dict['img_embedding'] = batch['obs']['next_img_embedding'][:, :self.model.n_obs_steps]
+                                next_obs_dict['agent_pos'] = batch['obs']['next_state'][:, :self.model.n_obs_steps]
+                            elif getattr(self.model, 'is_image_policy', False):
+                                next_obs_dict['image']     = batch['obs']['next_img'][:, :self.model.n_obs_steps]
                                 next_obs_dict['agent_pos'] = batch['obs']['next_state'][:, :self.model.n_obs_steps]
                             else:
-                                next_obs_dict['agent_pos'] = batch['obs']['agent_pos'][:, :self.model.n_obs_steps]
+                                next_obs_dict['full_state'] = batch['obs']['next_full_state'][:, :self.model.n_obs_steps]
+                                
                             next_nobs = self.model.normalizer.normalize(next_obs_dict)
                             next_nobs = dict_apply(next_nobs, lambda x: x.to(device))
                             next_vis_cond = self.model.obs_encoder(next_nobs)
@@ -375,6 +395,8 @@ class TrainFlowQLAdroitWorkspace:
                         vis_cond = vis_cond.reshape(batch_size, -1, self.model.obs_feature_dim)
                         lang_cond = None
 
+                        # _has_encoder = isinstance(self.model, DrQv2FlowPolicy) or getattr(self.model, 'is_embedding_policy', False)
+                        # ql_vis_cond = vis_cond.detach() if _has_encoder else vis_cond
                         ql_loss, ql_log = self.model.compute_flowql_loss(
                             batch, vis_cond, lang_cond, self.critic,
                             num_steps=num_sample_steps)
@@ -389,9 +411,11 @@ class TrainFlowQLAdroitWorkspace:
                     loss.backward()
 
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            max_norm=cfg.training.get("max_grad_norm", 1.0))
+                        _policy_grad_norm = cfg.training.get("max_grad_norm", 1.0)
+                        if _policy_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                max_norm=_policy_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
@@ -406,7 +430,7 @@ class TrainFlowQLAdroitWorkspace:
                             for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
                                 tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
-                    raw_loss_cpu = raw_loss.item()
+                    raw_loss_cpu = total_loss.item()
                     tepoch.set_postfix(loss=raw_loss_cpu, ql=ql_loss_val, critic=critic_loss_val, refresh=False)
                     train_losses.append(raw_loss_cpu)
                     step_log = {

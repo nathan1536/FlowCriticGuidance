@@ -115,13 +115,26 @@ def _save_replay_buffer_to_zarr(
 
     device = model.device
 
-    # Extract raw numpy arrays from SB3 replay buffer
+    # Build chronological index: when the circular buffer is full, data wraps
+    # around at replay_buffer.pos. Reorder so the zarr is chronological.
+    # For a full buffer, buf_size == buf_capacity and offset == buf_capacity - save_size,
+    # so chronological[offset:] selects exactly the most recent save_size transitions.
+    buf_capacity = replay_buffer.buffer_size
+    if replay_buffer.full:
+        pos = replay_buffer.pos
+        chronological = np.concatenate([np.arange(pos, buf_capacity),
+                                        np.arange(0, pos)])
+        idx = chronological[offset:]
+    else:
+        idx = np.arange(offset, buf_size)
+
+    # Extract raw numpy arrays from SB3 replay buffer in chronological order
     # SB3 stores shape (buffer_size, n_envs, *obs_shape); squeeze n_envs=1
-    obs_buf = replay_buffer.observations[offset:buf_size].squeeze(1)
-    next_obs_buf = replay_buffer.next_observations[offset:buf_size].squeeze(1)
-    act_buf = replay_buffer.actions[offset:buf_size].squeeze(1)
-    rew_buf = replay_buffer.rewards[offset:buf_size].squeeze(1)
-    done_buf = replay_buffer.dones[offset:buf_size].squeeze(1)
+    obs_buf = replay_buffer.observations[idx].squeeze(1)
+    next_obs_buf = replay_buffer.next_observations[idx].squeeze(1)
+    act_buf = replay_buffer.actions[idx].squeeze(1)
+    rew_buf = replay_buffer.rewards[idx].squeeze(1)
+    done_buf = replay_buffer.dones[idx].squeeze(1)
 
     full_state_arr = obs_buf.astype(np.float32)
     next_full_state_arr = next_obs_buf.astype(np.float32)
@@ -213,6 +226,21 @@ def _save_replay_buffer_to_zarr(
     _save("v_value", v_value_arr, chunks=(min(100, save_size),))
     _save("advantage", adv_arr, chunks=(min(100, save_size),))
 
+    # Per-episode success: label every transition with whether its episode succeeded
+    episode_success_arr = np.zeros(save_size, dtype=np.float32)
+    if env is not None and getattr(env, "_success_flags", None) is not None:
+        step_success = env._success_flags[idx].astype(np.float32)
+        ep_starts = np.concatenate([[0], episode_ends[:-1]])
+        for ep_i, (s, e) in enumerate(zip(ep_starts, episode_ends)):
+            ep_succeeded = float(step_success[s:e].max() > 0.5)
+            episode_success_arr[s:e] = ep_succeeded
+        n_succ = int((episode_success_arr[ep_starts.astype(int)] > 0.5).sum())
+        print(f"[ReplayBuffer] Episode success: {n_succ}/{len(episode_ends)} episodes succeeded")
+    else:
+        print("[ReplayBuffer] No per-step success data available; episode_success will be all zeros")
+
+    _save("episode_success", episode_success_arr, chunks=(min(100, save_size),))
+
     # Render images from stored sim states
     has_images = False
     if env is not None and getattr(env, "_store_sim_states", False):
@@ -232,12 +260,8 @@ def _save_replay_buffer_to_zarr(
             dtype="uint8", overwrite=True, compressor=compressor,
         )
 
-        # Build set of episode-end indices for boundary detection
-        ep_end_set = set(episode_ends.tolist())
-
-        # Stream images directly into zarr to avoid OOM
         RENDER_BATCH = 1000
-        img_batch = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
+        img_batch      = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
         next_img_batch = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
         batch_idx = 0
         batch_start = 0
@@ -251,34 +275,23 @@ def _save_replay_buffer_to_zarr(
                 mode="offscreen", camera_name=cam, device_id=device_id,
             ).astype(np.uint8)
 
-        for i in range(offset, buf_size):
-            local_idx = i - offset  # index in the saved arrays
-
-            # Current image
-            img_batch[batch_idx] = _render_sim_state(env._sim_states[i])
-
-            # Next image: use sim_states[i+1] if within same episode, else black
-            is_terminal = (local_idx + 1) in ep_end_set
-            if is_terminal or (i + 1) >= buf_size:
-                next_img_batch[batch_idx] = 0  # terminal or buffer end → black
-            else:
-                next_img_batch[batch_idx] = _render_sim_state(env._sim_states[i + 1])
-
+        for local_idx, buf_idx in enumerate(idx):
+            img_batch[batch_idx]      = _render_sim_state(env._sim_states[buf_idx])
+            next_img_batch[batch_idx] = _render_sim_state(env._next_sim_states[buf_idx])
             batch_idx += 1
             if batch_idx == RENDER_BATCH:
-                img_dataset[batch_start:batch_start + batch_idx] = img_batch[:batch_idx]
+                img_dataset[batch_start:batch_start + batch_idx]      = img_batch[:batch_idx]
                 next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
                 batch_start += batch_idx
                 batch_idx = 0
             if (local_idx + 1) % 50000 == 0:
                 print(f"  rendered {local_idx + 1}/{save_size} ...")
-        # Flush remaining
         if batch_idx > 0:
-            img_dataset[batch_start:batch_start + batch_idx] = img_batch[:batch_idx]
+            img_dataset[batch_start:batch_start + batch_idx]      = img_batch[:batch_idx]
             next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
         has_images = True
-        print(f"  images saved: shape={img_dataset.shape}")
-        print(f"  next_images saved: shape={next_img_dataset.shape}")
+        print(f"  img saved: shape={img_dataset.shape}")
+        print(f"  next_img saved: shape={next_img_dataset.shape}")
 
     zarr_meta.create_dataset(
         "episode_ends", data=episode_ends,
@@ -331,8 +344,8 @@ def parse_args():
                    help="Number of parallel envs (mujoco-py rendering limits concurrency; 1 is safest)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", type=str, default="auto", help="SB3 device: auto|cpu|cuda")
-    p.add_argument("--log-dir", type=str, default="runs/sb3_adroit_sac")
-    p.add_argument("--save-dir", type=str, default="runs/sb3_adroit_sac/models_84")
+    p.add_argument("--log-dir", type=str, default="runs/sb3_adroit_sac_new")
+    p.add_argument("--save-dir", type=str, default="runs/sb3_adroit_sac_new/models_84")
     p.add_argument("--monitor-dir", type=str, default="",
                    help="If set, write Monitor CSVs for reward curves.")
     p.add_argument("--tensorboard", action="store_true", default=True, help="Enable tensorboard logging")
@@ -497,6 +510,7 @@ def main():
             self.save_rb_at_success = save_rb_at_success
             self.save_all_checkpoints = save_all_checkpoints
             self._rb_saved = False  # True once replay buffer has been saved (when using save_rb_at_success)
+            self._rb_saved_1m = False  # True once 1M checkpoint has been saved
             self._saved_85_count = 0
             self._max_85_saves = 5
 
@@ -533,7 +547,7 @@ def main():
                 model=self.model,
                 task_key=self.task_key,
                 out_path=rb_path,
-                env=train_env if has_images else None,
+                env=train_env,
                 image_size=self.image_size,
                 camera_name=self.camera_name,
                 device_id=self.device_id,
@@ -581,15 +595,33 @@ def main():
                 if self.verbose:
                     print(f"  [Checkpoint] t={self.num_timesteps} success={success_rate:.2f} -> {ckpt_path.name}")
 
-            if success_rate >= 0.75 and self._saved_85_count < self._max_85_saves:
-                self._saved_85_count += 1
-                ckpt_path = self.save_dir / f"diverse_85_{self._saved_85_count}_t{self.num_timesteps}.zip"
-                self.model.save(str(ckpt_path))
-                _save_sac_twin_critic(self.model, ckpt_path.with_suffix("").with_name(ckpt_path.stem + "_twin_critic_q.pt"))
-                self._save_rb(f"diverse_85_{self._saved_85_count}_t{self.num_timesteps}", success_rate)
-                if self.verbose:
-                    print(f"  [Diverse 85%] #{self._saved_85_count}/{self._max_85_saves} "
-                          f"success={success_rate:.2f} -> {ckpt_path.name}")
+            # # Save replay buffer at 3M timesteps (always, regardless of prior saves)
+            # if self.num_timesteps >= 2_800_000 and not self._rb_saved_1m:
+            #     self._rb_saved_1m = True
+            #     ckpt_path = self.save_dir / f"ckpt_t{self.num_timesteps}.zip"
+            #     self.model.save(str(ckpt_path))
+            #     _save_sac_twin_critic(self.model, self.save_dir / f"ckpt_t{self.num_timesteps}_twin_critic_q.pt")
+            #     if self.save_replay_buffer:
+            #         train_env = self._get_training_env()
+            #         rb_path = self.save_dir / f"replay_buffer_t{self.num_timesteps}.zarr"
+            #         _save_replay_buffer_to_zarr(
+            #             model=self.model, task_key=self.task_key, out_path=rb_path,
+            #             env=train_env,
+            #             image_size=self.image_size, camera_name=self.camera_name,
+            #             device_id=self.device_id, save_last_n=self.save_last_n,
+            #         )
+            #     if self.verbose:
+            #         print(f"  [3M Checkpoint] t={self.num_timesteps} success={success_rate:.2f} -> {ckpt_path.name}")
+
+            # if success_rate >= 0.75 and self._saved_85_count < self._max_85_saves:
+            #     self._saved_85_count += 1
+            #     ckpt_path = self.save_dir / f"diverse_85_{self._saved_85_count}_t{self.num_timesteps}.zip"
+            #     self.model.save(str(ckpt_path))
+            #     _save_sac_twin_critic(self.model, ckpt_path.with_suffix("").with_name(ckpt_path.stem + "_twin_critic_q.pt"))
+            #     self._save_rb(f"diverse_85_{self._saved_85_count}_t{self.num_timesteps}", success_rate)
+            #     if self.verbose:
+            #         print(f"  [Diverse 85%] #{self._saved_85_count}/{self._max_85_saves} "
+            #               f"success={success_rate:.2f} -> {ckpt_path.name}")
 
             if self.verbose:
                 print(
@@ -611,36 +643,36 @@ def main():
                 if self.verbose:
                     print(f"  [Best] metric={self.best_metric} value={value:.3f} -> {best_path}")
 
-            if success_rate >= 0.9:
-                ent_coef = float(self.model.log_ent_coef.exp().item())
-                if not hasattr(self, "_diverse_models"):
-                    self._diverse_models = []
+            # if success_rate >= 0.9:
+            #     ent_coef = float(self.model.log_ent_coef.exp().item())
+            #     if not hasattr(self, "_diverse_models"):
+            #         self._diverse_models = []
 
-                tag = f"diverse_ent{ent_coef:.5f}_t{self.num_timesteps}"
-                cand_path = self.save_dir / f"{tag}.zip"
-                self.model.save(str(cand_path))
-                _save_sac_twin_critic(self.model, cand_path.with_name(f"{tag}_twin_critic_q.pt"))
-                self._save_rb(tag, success_rate)
-                self._diverse_models.append((ent_coef, self.num_timesteps, cand_path))
+            #     tag = f"diverse_ent{ent_coef:.5f}_t{self.num_timesteps}"
+            #     cand_path = self.save_dir / f"{tag}.zip"
+            #     self.model.save(str(cand_path))
+            #     _save_sac_twin_critic(self.model, cand_path.with_name(f"{tag}_twin_critic_q.pt"))
+            #     self._save_rb(tag, success_rate)
+            #     self._diverse_models.append((ent_coef, self.num_timesteps, cand_path))
 
-                self._diverse_models.sort(key=lambda x: x[0], reverse=True)
-                while len(self._diverse_models) > 3:
-                    old_ent, old_t, old_path = self._diverse_models.pop()
-                    if old_path.exists():
-                        old_path.unlink()
-                    old_critic = old_path.with_name(old_path.stem + "_twin_critic_q.pt")
-                    if old_critic.exists():
-                        old_critic.unlink()
-                    # Clean up old replay buffer zarr
-                    old_tag = f"diverse_ent{old_ent:.5f}_t{old_t}"
-                    old_rb = self.save_dir / f"replay_buffer_{old_tag}.zarr"
-                    if old_rb.exists():
-                        import shutil
-                        shutil.rmtree(old_rb)
+            #     self._diverse_models.sort(key=lambda x: x[0], reverse=True)
+            #     while len(self._diverse_models) > 3:
+            #         old_ent, old_t, old_path = self._diverse_models.pop()
+            #         if old_path.exists():
+            #             old_path.unlink()
+            #         old_critic = old_path.with_name(old_path.stem + "_twin_critic_q.pt")
+            #         if old_critic.exists():
+            #             old_critic.unlink()
+            #         # Clean up old replay buffer zarr
+            #         old_tag = f"diverse_ent{old_ent:.5f}_t{old_t}"
+            #         old_rb = self.save_dir / f"replay_buffer_{old_tag}.zarr"
+            #         if old_rb.exists():
+            #             import shutil
+            #             shutil.rmtree(old_rb)
 
-                if self.verbose:
-                    print(f"  [Diverse] success={success_rate:.2f} ent_coef={ent_coef:.5f} "
-                          f"saved={cand_path.name} (top-3: {[f'{e:.5f}' for e,_,_ in self._diverse_models]})")
+            #     if self.verbose:
+            #         print(f"  [Diverse] success={success_rate:.2f} ent_coef={ent_coef:.5f} "
+            #               f"saved={cand_path.name} (top-3: {[f'{e:.5f}' for e,_,_ in self._diverse_models]})")
 
             return True
 

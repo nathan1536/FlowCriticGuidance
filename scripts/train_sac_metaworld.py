@@ -168,56 +168,23 @@ def _save_replay_buffer_to_zarr(
         print("[ReplayBuffer] No per-step success data; episode_success will be all zeros")
     _save("episode_success", episode_success_arr, chunks=(min(100, save_size),))
 
-    # Render images from stored sim states
-    has_images = False
+    # Save sim qpos/qvel so images can be rendered later by a separate script
     if env is not None and getattr(env, "_store_sim_states", False):
-        cam = camera_name or METAWORLD_CAMERAS["default"]
-        print(f"[ReplayBuffer] Rendering {save_size} images ({image_size}x{image_size}, camera={cam}) ...")
-        mj_env = env.env  # underlying MetaWorld environment (has .sim)
-        img_shape = (image_size, image_size, 3)
-        img_dataset = zarr_data.create_dataset(
-            "img", shape=(save_size, *img_shape),
-            chunks=(100, *img_shape), dtype="uint8", overwrite=True, compressor=compressor,
-        )
-        next_img_dataset = zarr_data.create_dataset(
-            "next_img", shape=(save_size, *img_shape),
-            chunks=(100, *img_shape), dtype="uint8", overwrite=True, compressor=compressor,
-        )
+        _save("sim_qpos",      env._sim_qpos[idx].astype(np.float32))
+        _save("sim_qvel",      env._sim_qvel[idx].astype(np.float32))
+        _save("next_sim_qpos", env._next_sim_qpos[idx].astype(np.float32))
+        _save("next_sim_qvel", env._next_sim_qvel[idx].astype(np.float32))
+        print(f"[ReplayBuffer] Saved sim_qpos/qvel ({env._sim_qpos.shape[1]}D pos, "
+              f"{env._sim_qvel.shape[1]}D vel) for deferred image rendering")
 
-        RENDER_BATCH = 1000
-        img_batch      = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
-        next_img_batch = np.zeros((RENDER_BATCH, *img_shape), dtype=np.uint8)
-        batch_idx  = 0
-        batch_start = 0
-
-        def _render_sim_state(state):
-            if state is None:
-                return np.zeros(img_shape, dtype=np.uint8)
-            mj_env.sim.set_state(state)
-            mj_env.sim.forward()
-            return mj_env.sim.render(
-                width=image_size, height=image_size,
-                mode="offscreen", camera_name=cam, device_id=device_id,
-            ).astype(np.uint8)
-
-        for local_idx, buf_idx in enumerate(idx):
-            img_batch[batch_idx]      = _render_sim_state(env._sim_states[buf_idx])
-            next_img_batch[batch_idx] = _render_sim_state(env._next_sim_states[buf_idx])
-            batch_idx += 1
-            if batch_idx == RENDER_BATCH:
-                img_dataset[batch_start:batch_start + batch_idx]      = img_batch[:batch_idx]
-                next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
-                batch_start += batch_idx
-                batch_idx = 0
-            if (local_idx + 1) % 50000 == 0:
-                print(f"  rendered {local_idx + 1}/{save_size} ...")
-        if batch_idx > 0:
-            img_dataset[batch_start:batch_start + batch_idx]      = img_batch[:batch_idx]
-            next_img_dataset[batch_start:batch_start + batch_idx] = next_img_batch[:batch_idx]
-        has_images = True
-
+    # episode_ends and buf_idx saved before any rendering so the zarr is valid even
+    # if image rendering is interrupted
     zarr_meta.create_dataset(
         "episode_ends", data=episode_ends,
+        dtype="int64", overwrite=True, compressor=compressor,
+    )
+    zarr_meta.create_dataset(
+        "buf_idx", data=idx.astype(np.int64),
         dtype="int64", overwrite=True, compressor=compressor,
     )
 
@@ -226,11 +193,9 @@ def _save_replay_buffer_to_zarr(
     ep_lens = episode_ends - ep_starts
     ep_rewards = np.array([rew_arr[s:e].sum() for s, e in zip(ep_starts, episode_ends)])
 
-    print(f"\n[ReplayBuffer -> Zarr] Saved to {out_path}")
+    print(f"\n[ReplayBuffer -> Zarr] Non-image data saved to {out_path}")
     print(f"  transitions : {save_size}" + (f" (last {save_last_n} of {buf_size})" if offset > 0 else ""))
     print(f"  episodes    : {n_episodes}")
-    if has_images:
-        print(f"  images      : ({save_size}, {image_size}, {image_size}, 3) [img + next_img]")
     print(f"  ep lengths  : mean={ep_lens.mean():.1f} min={ep_lens.min()} max={ep_lens.max()}")
     print(f"  ep rewards  : mean={ep_rewards.mean():.1f} std={ep_rewards.std():.1f}")
     print(f"  Q(s,a)      : mean={q_value_arr.mean():.1f} std={q_value_arr.std():.1f}")
@@ -238,6 +203,8 @@ def _save_replay_buffer_to_zarr(
     print(f"  Advantage   : mean={adv_arr.mean():.3f} std={adv_arr.std():.3f} "
           f"positive={100*(adv_arr>0).mean():.1f}%")
     print(f"  Shapes: full_state={full_state_arr.shape} state={state_arr.shape} action={act_arr.shape}")
+    if env is not None and getattr(env, "_store_sim_states", False):
+        print(f"  sim_qpos/qvel saved — run render_images_to_zarr.py to add img + next_img")
 
 
 def _save_sac_twin_critic(model, save_path: Path) -> None:

@@ -149,16 +149,7 @@ class TrainFlowQLMetaWorldWorkspace:
         dataset: BaseDataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseDataset)
 
-        reward_tune = flowql_cfg.get("reward_tune", "normalize")
-        if hasattr(dataset, 'has_rl_signals') and dataset.has_rl_signals and reward_tune != "no":
-            reward_data = dataset.replay_buffer['reward']
-            raw_mean, raw_std = reward_data.mean(), reward_data.std()
-            raw_min,  raw_max  = reward_data.min(),  reward_data.max()
-            if reward_tune == "normalize":
-                reward_data[:] = (reward_data - raw_mean) / (raw_std + 1e-8)
-            cprint(f"Reward {reward_tune}: raw [{raw_min:.2f}, {raw_max:.2f}] "
-                   f"mean={raw_mean:.2f} std={raw_std:.2f} "
-                   f"-> new [{reward_data.min():.2f}, {reward_data.max():.2f}]", 'green')
+
 
         num_batches = cfg.training.get("num_batches", None)
         if num_batches is not None:
@@ -174,6 +165,17 @@ class TrainFlowQLMetaWorldWorkspace:
             train_dataloader_iter = None
 
         normalizer = dataset.get_normalizer()
+
+        reward_tune = flowql_cfg.get("reward_tune", "normalize")
+        if hasattr(dataset, 'has_rl_signals') and dataset.has_rl_signals and reward_tune != "no":
+            reward_data = dataset.replay_buffer['reward']
+            raw_mean, raw_std = reward_data.mean(), reward_data.std()
+            raw_min,  raw_max  = reward_data.min(),  reward_data.max()
+            if reward_tune == "normalize":
+                reward_data[:] = reward_data / (raw_std + 1e-8)
+            cprint(f"Reward {reward_tune}: raw [{raw_min:.2f}, {raw_max:.2f}] "
+                   f"mean={raw_mean:.2f} std={raw_std:.2f} "
+                   f"-> new [{reward_data.min():.2f}, {reward_data.max():.2f}]", 'green')
 
         cprint(f"Dataset: {dataset.__class__.__name__}", 'red')
         if hasattr(dataset, 'zarr_path'):
@@ -385,7 +387,7 @@ class TrainFlowQLMetaWorldWorkspace:
                                              self.critic_target.parameters()):
                                 tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
-                    raw_loss_cpu = raw_loss.item()
+                    raw_loss_cpu = total_loss.item()
                     tepoch.set_postfix(loss=raw_loss_cpu, ql=ql_loss_val,
                                        critic=critic_loss_val, refresh=False)
                     train_losses.append(raw_loss_cpu)
