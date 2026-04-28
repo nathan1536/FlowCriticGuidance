@@ -44,14 +44,14 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
     def __init__(self,
                  mcr_ckpt_path: str,
                  embedding_dim: int = EMBEDDING_DIM,
-                 agent_pos_dim: int = 9,
+                #  agent_pos_dim: int = 9,
                  **state_policy_kwargs):
         # FlowMLP conditioned on embedding + agent_pos
         # super().__init__(state_dim=embedding_dim + agent_pos_dim, **state_policy_kwargs)
         super().__init__(state_dim=embedding_dim, **state_policy_kwargs)
         self.embedding_dim = embedding_dim
         # self.agent_pos_dim = agent_pos_dim
-        self.embedding_bn = nn.BatchNorm1d(embedding_dim)
+        # self.embedding_bn = nn.BatchNorm1d(embedding_dim)
 
         # Load frozen MCR
         MCR_DIR = str(pathlib.Path(__file__).parent.parent.parent.parent
@@ -73,8 +73,8 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
         returns               : (B, T, 2048 + agent_pos_dim)
         """
         emb = nobs['img_embedding']                       # (B, T, 2048)
-        B, T, D = emb.shape
-        emb = self.embedding_bn(emb.reshape(B * T, D)).reshape(B, T, D)
+        # B, T, D = emb.shape
+        # emb = self.embedding_bn(emb.reshape(B * T, D)).reshape(B, T, D)
         # pos = nobs['agent_pos'].to(emb.device)            # (B, T, agent_pos_dim)
         return emb
         # return torch.cat([emb, pos], dim=-1)              # (B, T, 2048 + agent_pos_dim)
@@ -115,13 +115,14 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
 
         if 'img_embedding' in obs_dict:
             embedding = obs_dict['img_embedding'][:, :self.n_obs_steps].to(device)
+            embedding = self.normalizer['img_embedding'].normalize(embedding)
         else:
             img = obs_dict['image'][:, :self.n_obs_steps]   # (B, T, H, W, C)
             embedding = self._encode_images(img)             # (B, T, 2048)
             embedding = self.normalizer['img_embedding'].normalize(embedding)
 
         B, T, D = embedding.shape
-        embedding = self.embedding_bn(embedding.reshape(B * T, D)).reshape(B, T, D)
+        # embedding = self.embedding_bn(embedding.reshape(B * T, D)).reshape(B, T, D)
 
         # agent_pos = obs_dict['agent_pos'][:, :self.n_obs_steps].to(device)
         # agent_pos = self.normalizer['agent_pos'].normalize(agent_pos)
