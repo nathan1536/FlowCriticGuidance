@@ -395,10 +395,10 @@ class TrainFlowQLAdroitWorkspace:
                         vis_cond = vis_cond.reshape(batch_size, -1, self.model.obs_feature_dim)
                         lang_cond = None
 
-                        # _has_encoder = isinstance(self.model, DrQv2FlowPolicy) or getattr(self.model, 'is_embedding_policy', False)
-                        # ql_vis_cond = vis_cond.detach() if _has_encoder else vis_cond
+                        _has_encoder = isinstance(self.model, DrQv2FlowPolicy) or getattr(self.model, 'is_embedding_policy', False)
+                        ql_vis_cond = vis_cond.detach() if _has_encoder else vis_cond
                         ql_loss, ql_log = self.model.compute_flowql_loss(
-                            batch, vis_cond, lang_cond, self.critic,
+                            batch, ql_vis_cond, lang_cond, self.critic,
                             num_steps=num_sample_steps)
 
                         total_loss = alpha * raw_loss + eta * ql_loss
