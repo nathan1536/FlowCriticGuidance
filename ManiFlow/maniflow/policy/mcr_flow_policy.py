@@ -44,14 +44,21 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
     def __init__(self,
                  mcr_ckpt_path: str,
                  embedding_dim: int = EMBEDDING_DIM,
-                #  agent_pos_dim: int = 9,
+                 agent_pos_dim: int = 0,
+                 agent_pos_proj_dim: int = 256,
                  **state_policy_kwargs):
-        # FlowMLP conditioned on embedding + agent_pos
-        # super().__init__(state_dim=embedding_dim + agent_pos_dim, **state_policy_kwargs)
-        super().__init__(state_dim=embedding_dim, **state_policy_kwargs)
+        # agent_pos projected to agent_pos_proj_dim before concat with embedding
+        obs_dim = embedding_dim + (agent_pos_proj_dim if agent_pos_dim > 0 else 0)
+        super().__init__(state_dim=obs_dim, **state_policy_kwargs)
         self.embedding_dim = embedding_dim
-        # self.agent_pos_dim = agent_pos_dim
-        # self.embedding_bn = nn.BatchNorm1d(embedding_dim)
+        self.agent_pos_dim = agent_pos_dim
+        self.agent_pos_proj = (
+            nn.Sequential(
+                nn.Linear(agent_pos_dim, agent_pos_proj_dim // 2), nn.ReLU(),
+                nn.Linear(agent_pos_proj_dim // 2, agent_pos_proj_dim), nn.ReLU(),
+            )
+            if agent_pos_dim > 0 else None
+        )
 
         # Load frozen MCR
         MCR_DIR = str(pathlib.Path(__file__).parent.parent.parent.parent
@@ -67,17 +74,13 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
     # ── encoder ───────────────────────────────────────────────
 
     def obs_encoder(self, nobs: dict) -> torch.Tensor:
-        """
-        nobs['img_embedding'] : (B, T, 2048)
-        nobs['agent_pos']     : (B, T, agent_pos_dim)
-        returns               : (B, T, 2048 + agent_pos_dim)
-        """
         emb = nobs['img_embedding']                       # (B, T, 2048)
-        # B, T, D = emb.shape
-        # emb = self.embedding_bn(emb.reshape(B * T, D)).reshape(B, T, D)
-        # pos = nobs['agent_pos'].to(emb.device)            # (B, T, agent_pos_dim)
+        if self.agent_pos_dim > 0:
+            B, T, _ = emb.shape
+            pos = nobs['agent_pos'].to(emb.device)        # (B, T, agent_pos_dim)
+            pos = self.agent_pos_proj(pos.reshape(B * T, -1)).reshape(B, T, -1)  # (B, T, proj_dim)
+            return torch.cat([emb, pos], dim=-1)          # (B, T, 2048 + proj_dim)
         return emb
-        # return torch.cat([emb, pos], dim=-1)              # (B, T, 2048 + agent_pos_dim)
 
     # ── inference ─────────────────────────────────────────────────────────────
 
@@ -122,15 +125,15 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
             embedding = self.normalizer['img_embedding'].normalize(embedding)
 
         B, T, D = embedding.shape
-        # embedding = self.embedding_bn(embedding.reshape(B * T, D)).reshape(B, T, D)
 
-        # agent_pos = obs_dict['agent_pos'][:, :self.n_obs_steps].to(device)
-        # agent_pos = self.normalizer['agent_pos'].normalize(agent_pos)
-
-        # combined = torch.cat([embedding, agent_pos], dim=-1)  # (B, T, 2048+agent_pos_dim)
-        # vis_cond = combined.reshape(B, -1, self.obs_feature_dim)
-
-        vis_cond = embedding.reshape(B, -1, self.embedding_dim)  # (B, T, 2048)
+        if self.agent_pos_dim > 0:
+            agent_pos = obs_dict['agent_pos'][:, :self.n_obs_steps].to(device)
+            agent_pos = self.normalizer['agent_pos'].normalize(agent_pos)
+            pos_proj = self.agent_pos_proj(agent_pos.reshape(B * T, -1)).reshape(B, T, -1)
+            combined = torch.cat([embedding, pos_proj], dim=-1)
+            vis_cond = combined.reshape(B, -1, self.obs_feature_dim)
+        else:
+            vis_cond = embedding.reshape(B, -1, self.obs_feature_dim)
 
         noise = torch.randn(B, self.horizon, self.action_dim, device=device, dtype=dtype)
         traj  = self.sample_ode(x0=noise, N=self.num_inference_steps, vis_cond=vis_cond)
