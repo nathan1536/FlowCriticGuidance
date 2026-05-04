@@ -125,11 +125,6 @@ class TrainFlowQLAdroitWorkspace:
         num_batches_per_epoch = cfg.training.get("num_batches", 100)
         lr_maxt = cfg.training.num_epochs * num_batches_per_epoch
         critic_lr_scheduler = None
-        if lr_decay:
-            from torch.optim.lr_scheduler import CosineAnnealingLR
-            critic_lr_scheduler = CosineAnnealingLR(
-                self.critic_optimizer, T_max=lr_maxt, eta_min=0.)
-            cprint(f"Critic LR decay: CosineAnnealingLR, T_max={lr_maxt}", 'green')
 
         if cfg.training.debug:
             cfg.training.num_epochs = 100
@@ -155,6 +150,13 @@ class TrainFlowQLAdroitWorkspace:
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+
+        if lr_decay:
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+            critic_lr_scheduler = CosineAnnealingLR(
+                self.critic_optimizer, T_max=lr_maxt, eta_min=0.,
+                last_epoch=self.global_step - 1)
+            cprint(f"Critic LR decay: CosineAnnealingLR, T_max={lr_maxt}, last_epoch={self.global_step - 1}", 'green')
 
 
         dataset: BaseDataset
@@ -201,12 +203,13 @@ class TrainFlowQLAdroitWorkspace:
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        steps_per_epoch = num_batches 
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
+                steps_per_epoch * cfg.training.num_epochs) \
                     // cfg.training.gradient_accumulate_every,
             last_epoch=self.global_step-1
         )
@@ -293,12 +296,14 @@ class TrainFlowQLAdroitWorkspace:
                     critic_loss_val = 0.0
                     target_q_mean = 0.0
                     if ql_active and 'reward' in batch['obs']:
+                        # RL signals (state, action, reward, done) are stored once per transition
+                        # regardless of n_obs_steps, so always index at 0
                         exec_start = self.model.n_obs_steps - 1
-                        states = batch['obs']['full_state'][:, exec_start]       # (B, state_dim)
-                        actions = batch['action'][:, exec_start]                  # (B, action_dim)
-                        rewards = batch['obs']['reward'][:, exec_start]           # (B,)
-                        dones = batch['obs']['done'][:, exec_start]               # (B,)
-                        next_states = batch['obs']['next_full_state'][:, exec_start]  # (B, state_dim)
+                        states = batch['obs']['full_state'][:, 0]                # (B, state_dim)
+                        actions = batch['action'][:, 0]                          # (B, action_dim)
+                        rewards = batch['obs']['reward'][:, 0]                   # (B,)
+                        dones = batch['obs']['done'][:, 0]                       # (B,)
+                        next_states = batch['obs']['next_full_state'][:, 0]      # (B, state_dim)
 
                         with torch.no_grad():
                             ema_policy = self.ema_model if self.ema_model is not None else self.model
@@ -321,10 +326,13 @@ class TrainFlowQLAdroitWorkspace:
                             #     next_obs_dict['full_state'] = batch['obs']['next_full_state'][:, :self.model.n_obs_steps]
                             if getattr(self.model, 'is_embedding_policy', False):
                                 next_obs_dict['img_embedding'] = batch['obs']['next_img_embedding'][:, :self.model.n_obs_steps]
-                                next_obs_dict['agent_pos'] = batch['obs']['next_state'][:, :self.model.n_obs_steps]
                             elif getattr(self.model, 'is_image_policy', False):
-                                next_obs_dict['image']     = batch['obs']['next_img'][:, :self.model.n_obs_steps]
-                                next_obs_dict['agent_pos'] = batch['obs']['next_state'][:, :self.model.n_obs_steps]
+                                # Slide the obs window: drop oldest frame, append next_img
+                                # current: [t-2, t-1, t], next stack: [t-1, t, t+1]
+                                next_obs_dict['image'] = torch.cat([
+                                    batch['obs']['image'][:, 1:],    # (B, T-1, H, W, C)
+                                    batch['obs']['next_img'][:, :1], # (B, 1,   H, W, C)
+                                ], dim=1)                            # (B, T,   H, W, C)
                             else:
                                 next_obs_dict['full_state'] = batch['obs']['next_full_state'][:, :self.model.n_obs_steps]
                                 
@@ -349,7 +357,7 @@ class TrainFlowQLAdroitWorkspace:
                                     x0=noise_rpt, N=num_sample_steps,
                                     vis_cond=next_vis_cond_rpt)[-1]
                                 next_actions_raw = self.model.normalizer['action'].unnormalize(next_actions_norm)
-                                next_a0 = next_actions_raw[:, exec_start].clamp(-1, 1)
+                                next_a0 = next_actions_raw[:, 0].clamp(-1, 1)
                                 target_q = self.critic_target.q_min(next_states_rpt, next_a0)
                                 target_q = target_q.view(batch_size, n_repeat).max(dim=1, keepdim=True)[0]
                             else:
@@ -357,7 +365,7 @@ class TrainFlowQLAdroitWorkspace:
                                     x0=noise, N=num_sample_steps,
                                     vis_cond=next_vis_cond)[-1]
                                 next_actions_raw = self.model.normalizer['action'].unnormalize(next_actions_norm)
-                                next_a0 = next_actions_raw[:, exec_start].clamp(-1, 1)
+                                next_a0 = next_actions_raw[:, 0].clamp(-1, 1)
                                 target_q = self.critic_target.q_min(next_states, next_a0)  # (B, 1)
 
                             target_q = (rewards.unsqueeze(-1) + (1.0 - dones.unsqueeze(-1)) * discount * target_q).detach()
