@@ -16,6 +16,7 @@ class AdroitImageDataset(BaseDataset):
     def __init__(self,
             zarr_path,
             horizon=1,
+            n_obs_steps=1,
             pad_before=0,
             pad_after=0,
             seed=42,
@@ -31,6 +32,7 @@ class AdroitImageDataset(BaseDataset):
         super().__init__()
         cprint(f'Loading AdroitImageDataset from {zarr_path}', 'green')
         self.task_name = task_name
+        self.n_obs_steps = n_obs_steps
         self.use_img = use_img
         self.use_depth = use_depth
         self.use_full_state = use_full_state
@@ -44,6 +46,7 @@ class AdroitImageDataset(BaseDataset):
         
         # Lazy load img from zarr (avoid ~46GB in RAM)
         self.lazy_img_zarr = None
+        self.lazy_next_img_zarr = None
         if self.use_img:
             #self.lazy_img_zarr = zarr.open(zarr_path, mode='r')['data']['img']
             cprint(f'  Images: deferred lazy zarr loading setup', 'yellow')
@@ -60,10 +63,10 @@ class AdroitImageDataset(BaseDataset):
         try:
             _zr = zarr.open(zarr_path, mode='r')
             # Only load v_value for advantage weighting if NOT using RL signals (FlowQL trains its own critic)
-            if self.use_full_state and 'v_value' in _zr['data'] and not self.use_rl_signals:
-                buffer_keys.append('v_value')
-                self.has_v_value = True
-                cprint('  Found v_value in zarr -> loading for advantage weighting', 'cyan')
+            # if self.use_full_state and 'v_value' in _zr['data'] and not self.use_rl_signals:
+            #     buffer_keys.append('v_value')
+            #     self.has_v_value = True
+            #     cprint('  Found v_value in zarr -> loading for advantage weighting', 'cyan')
             if self.use_rl_signals:
                 rl_keys = ['reward', 'done', 'next_full_state', 'next_state']
                 available = [k for k in rl_keys if k in _zr['data']]
@@ -105,9 +108,9 @@ class AdroitImageDataset(BaseDataset):
             max_n=max_train_episodes, 
             seed=seed)
         self.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer, 
-            sequence_length=horizon,
-            pad_before=pad_before, 
+            replay_buffer=self.replay_buffer,
+            sequence_length=n_obs_steps + horizon - 1,
+            pad_before=max(pad_before, n_obs_steps - 1),
             pad_after=pad_after,
             episode_mask=train_mask)
         self.train_mask = train_mask
@@ -142,35 +145,20 @@ class AdroitImageDataset(BaseDataset):
             'action':    self.replay_buffer['action'],
             'agent_pos': self.replay_buffer['state'],
         }
+        if self.use_full_state:
+            data['full_state'] = self.replay_buffer['full_state']
         if self.has_embedding:
-            data['img_embedding']      = self.replay_buffer['img_embedding']
-            data['next_img_embedding'] = self.replay_buffer['next_img_embedding']
-
-        if self.has_rl_signals:
-            data['next_state'] = self.replay_buffer['next_state']
-
-
+            data['img_embedding'] = self.replay_buffer['img_embedding']
 
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
 
         if self.use_full_state:
-            normalizer['full_state'] = SingleFieldLinearNormalizer.create_identity()
+            normalizer['next_full_state'] = normalizer['full_state']
+        if self.has_embedding:
+            normalizer['next_img_embedding'] = normalizer['img_embedding']
         if self.has_rl_signals:
-            normalizer['next_state'] = SingleFieldLinearNormalizer.create_identity()
-            normalizer['next_full_state'] = SingleFieldLinearNormalizer.create_identity()
-        if self.use_img:
-            normalizer['image'] = SingleFieldLinearNormalizer.create_identity()
-        if self.use_depth:
-            normalizer['depth'] = SingleFieldLinearNormalizer.create_identity()
-        if self.has_v_value:
-            normalizer['v_value'] = SingleFieldLinearNormalizer.create_identity()
-        if self.has_rl_signals:
-            normalizer['reward'] = SingleFieldLinearNormalizer.create_identity()
-            normalizer['done'] = SingleFieldLinearNormalizer.create_identity()
-
-        if getattr(self, 'has_next_img', False):
-            normalizer['next_img'] = SingleFieldLinearNormalizer.create_identity()
+            normalizer['next_state'] = normalizer['agent_pos']
 
         return normalizer
 
@@ -182,7 +170,7 @@ class AdroitImageDataset(BaseDataset):
     #         normalizer['image'] = SingleFieldLinearNormalizer.create_identity()
     #     if self.use_depth:
     #         normalizer['depth'] = SingleFieldLinearNormalizer.create_identity()
-        
+    #
     #     normalizer['agent_pos'] = SingleFieldLinearNormalizer.create_identity()
     #     if self.use_full_state:
     #         normalizer['full_state'] = SingleFieldLinearNormalizer.create_identity()
@@ -198,37 +186,42 @@ class AdroitImageDataset(BaseDataset):
     #     if self.has_embedding:
     #         normalizer['img_embedding'] = SingleFieldLinearNormalizer.create_identity()
     #         normalizer['next_img_embedding'] = SingleFieldLinearNormalizer.create_identity()
-
+    #
     #     return normalizer
 
     def __len__(self) -> int:
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        agent_pos = sample['state'][:,].astype(np.float32)
+        # With n_obs_steps > 1, the sequence has n_obs_steps+horizon-1 steps.
+        # Images use all n_obs_steps frames; all other signals use only the
+        # current step (index n_obs_steps-1) to stay shape (1, ...).
+        n = self.n_obs_steps - 1
+
+        agent_pos = sample['state'][n:n+1].astype(np.float32)
 
         if self.use_depth:
-            depth = sample['depth'][:,].astype(np.float32)
+            depth = sample['depth'][n:n+1].astype(np.float32)
 
         data = {
             'obs': {
                 'agent_pos': agent_pos,
                 },
-            'action': sample['action'].astype(np.float32)}
+            'action': sample['action'][n:n+1].astype(np.float32)}
         if self.use_depth:
             data['obs']['depth'] = depth
         if self.use_full_state:
-            data['obs']['full_state'] = sample['full_state'][:,].astype(np.float32)
+            data['obs']['full_state'] = sample['full_state'][n:n+1].astype(np.float32)
         if self.has_v_value:
-            data['obs']['v_value'] = sample['v_value'][:,].astype(np.float32)
+            data['obs']['v_value'] = sample['v_value'][n:n+1].astype(np.float32)
         if self.has_rl_signals:
-            data['obs']['reward'] = sample['reward'][:,].astype(np.float32)
-            data['obs']['done'] = sample['done'][:,].astype(np.float32)
-            data['obs']['next_full_state'] = sample['next_full_state'][:,].astype(np.float32)
-            data['obs']['next_state'] = sample['next_state'][:,].astype(np.float32)
+            data['obs']['reward'] = sample['reward'][n:n+1].astype(np.float32)
+            data['obs']['done'] = sample['done'][n:n+1].astype(np.float32)
+            data['obs']['next_full_state'] = sample['next_full_state'][n:n+1].astype(np.float32)
+            data['obs']['next_state'] = sample['next_state'][n:n+1].astype(np.float32)
         if self.has_embedding:
-            data['obs']['img_embedding'] = sample['img_embedding'][:,].astype(np.float32)
-            data['obs']['next_img_embedding'] = sample['next_img_embedding'][:,].astype(np.float32)
+            data['obs']['img_embedding'] = sample['img_embedding'][n:n+1].astype(np.float32)
+            data['obs']['next_img_embedding'] = sample['next_img_embedding'][n:n+1].astype(np.float32)
         return data
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -273,7 +266,7 @@ class AdroitImageDataset(BaseDataset):
                 next_img_data[sample_start_idx:sample_end_idx] = next_img_sample
             else:
                 next_img_data = next_img_sample
-            data['obs']['next_img'] = next_img_data.astype(np.float32)
+            data['obs']['next_img'] = next_img_data[-1:].astype(np.float32)  # (1, H, W, C): frame at t+1
 
 
         to_torch_function = lambda x: torch.from_numpy(x) if x.__class__.__name__ == 'ndarray' else x

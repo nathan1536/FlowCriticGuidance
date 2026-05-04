@@ -29,7 +29,8 @@ class RandomShiftsAug(nn.Module):
         # x : (B, C, H, W)
         n, c, h, w = x.size()
         assert h == w
-        x = F.pad(x, (self.pad,) * 4, 'replicate')
+        padding = tuple([self.pad] * 4)
+        x = F.pad(x, padding, 'replicate')
         eps = 1.0 / (h + 2 * self.pad)
         arange = torch.linspace(-1.0 + eps, 1.0 - eps,
                                 h + 2 * self.pad, device=x.device, dtype=x.dtype)[:h]
@@ -86,41 +87,41 @@ class DrQv2Encoder(nn.Module):
 # Critic  (DRQ-v2 trunk + Q1/Q2 on full_state — no CNN)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class DrQv2StateCritic(nn.Module):
-    """
-    Asymmetric critic: Q(full_state, action) — no CNN, no trunk.
-    state_dim is already small (e.g. 39) and normalized, so the DRQ-v2
-    trunk (which exists to compress repr_dim=39200) is unnecessary here.
+# class DrQv2StateCritic(nn.Module):
+#     """
+#     Asymmetric critic: Q(full_state, action) — no CNN, no trunk.
+#     state_dim is already small (e.g. 39) and normalized, so the DRQ-v2
+#     trunk (which exists to compress repr_dim=39200) is unnecessary here.
 
-      Q1/Q2 : Linear(state_dim + action_dim, hidden) → ReLU
-               → Linear(hidden, hidden) → ReLU → Linear(hidden, 1)
-    """
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, **kwargs):
-        super().__init__()
-        def _q_net():
-            return nn.Sequential(
-                nn.Linear(state_dim + action_dim, hidden_dim), nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim),             nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim),             nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, 1),
-            )
-        self.Q1 = _q_net()
-        self.Q2 = _q_net()
-        self._init_weights()
+#       Q1/Q2 : Linear(state_dim + action_dim, hidden) → ReLU
+#                → Linear(hidden, hidden) → ReLU → Linear(hidden, 1)
+#     """
+#     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, **kwargs):
+#         super().__init__()
+#         def _q_net():
+#             return nn.Sequential(
+#                 nn.Linear(state_dim + action_dim, hidden_dim), nn.ReLU(inplace=True),
+#                 nn.Linear(hidden_dim, hidden_dim),             nn.ReLU(inplace=True),
+#                 nn.Linear(hidden_dim, hidden_dim),             nn.ReLU(inplace=True),
+#                 nn.Linear(hidden_dim, 1),
+#             )
+#         self.Q1 = _q_net()
+#         self.Q2 = _q_net()
+#         self._init_weights()
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight)
-                nn.init.zeros_(m.bias)
+#     def _init_weights(self):
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear):
+#                 nn.init.orthogonal_(m.weight)
+#                 nn.init.zeros_(m.bias)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor):
-        x = torch.cat([state, action], dim=-1)
-        return self.Q1(x), self.Q2(x)
+#     def forward(self, state: torch.Tensor, action: torch.Tensor):
+#         x = torch.cat([state, action], dim=-1)
+#         return self.Q1(x), self.Q2(x)
 
-    def q_min(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        q1, q2 = self.forward(state, action)
-        return torch.min(q1, q2)
+#     def q_min(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+#         q1, q2 = self.forward(state, action)
+#         return torch.min(q1, q2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,24 +163,81 @@ class DrQv2FlowPolicy(ManiFlowStatePolicy):
     def obs_encoder(self, nobs: dict) -> torch.Tensor:
         """
         nobs['image'] : (B, T, H, W, C) float32, 0-255
-        returns       : (B, T, feature_dim)
+        returns       : (B, 1, feature_dim)  — T frames stacked along channel dim
         """
         img = nobs['image']                                       # (B, T, H, W, C) or (B, T, C, H, W)
         B, T = img.shape[:2]
-        img = img.reshape(B * T, *img.shape[2:])
-        # zarr dataset: (H, W, C) → permute to (C, H, W)
-        # env runner:   already (C, H, W) → no permute needed
-        if img.shape[-1] == self.obs_shape[0]:                    # channel-last (H, W, C)
-            img = img.permute(0, 3, 1, 2).contiguous()
-        else:                                                      # already channel-first (C, H, W)
+        ### Single frame obs ###
+        # img = img.reshape(B * T, *img.shape[2:])
+        # # zarr dataset: (H, W, C) → permute to (C, H, W)
+        # # env runner:   already (C, H, W) → no permute needed
+        # if img.shape[-1] == self.obs_shape[0]:                    # channel-last (H, W, C)
+        #     img = img.permute(0, 3, 1, 2).contiguous()
+        # else:                                                      # already channel-first (C, H, W)
+        #     img = img.contiguous()
+        ### Single frame obs ###
+
+
+        per_frame_C = self.obs_shape[0] // T                     # e.g. 9 // 3 = 3
+
+        # Convert to channel-first per frame: (B, T, C, H, W)
+        if img.shape[-1] == per_frame_C:                          # channel-last (B, T, H, W, C)
+            img = img.permute(0, 1, 4, 2, 3).contiguous()
+        else:                                                      # already channel-first (B, T, C, H, W)
             img = img.contiguous()
+
+        H, W = img.shape[3], img.shape[4]
+        img = img.reshape(B, T * per_frame_C, H, W)              # (B, T*C, H, W)
+
         if self.training:
-            img = self.aug(img)                                   # random shift aug
-        h    = self.cnn_encoder(img)                              # (B*T, repr_dim)
-        feat = self.trunk(h)                                      # (B*T, feature_dim)  ← trunk in actor
-        return feat.view(B, T, self.obs_feature_dim)              # (B, T, feature_dim)
+            img = self.aug(img)                                   # same spatial shift for all frames
+        h    = self.cnn_encoder(img)                              # (B, repr_dim)
+        feat = self.trunk(h)                                      # (B, feature_dim)
+        return feat.unsqueeze(1)                                  # (B, 1, feature_dim)
 
     # ── inference ─────────────────────────────────────────────────────────────
+
+    # def sample_action(self, image: 'np.ndarray', state: 'np.ndarray',
+    #                   critic, n_candidates: int = 50) -> 'np.ndarray':
+    #     """Q-guided action selection for image-based policy.
+
+    #     Args:
+    #         image: (T, H, W, C) uint8 numpy stacked frames (T = n_obs_steps)
+    #         state: (state_dim,) float numpy full state — passed to critic only
+    #         critic: with .q_min(state, action) -> (B, 1)
+    #     Returns:
+    #         (action_dim,) numpy action
+    #     """
+    #     import numpy as np
+    #     device = self.device
+
+    #     state_t  = torch.FloatTensor(state.reshape(1, -1)).to(device)
+    #     state_rpt = state_t.repeat(n_candidates, 1)                   # (N, state_dim)
+
+    #     img_t = torch.FloatTensor(image).to(device)                   # (T, H, W, C)
+    #     img_t = img_t.unsqueeze(0)                                    # (1, T, H, W, C)
+    #     img_t = img_t.expand(n_candidates, -1, -1, -1, -1).contiguous()  # (N, T, H, W, C)
+
+    #     nobs = self.normalizer.normalize({'image': img_t})
+    #     this_nobs = dict_apply(nobs, lambda x: x[:, :self.n_obs_steps, ...].to(device))
+    #     vis_cond = self.obs_encoder(this_nobs)                        # (N, T, feature_dim)
+    #     vis_cond = vis_cond.reshape(n_candidates, -1, self.obs_feature_dim)
+
+    #     noise = torch.randn(n_candidates, self.horizon, self.action_dim, device=device)
+
+    #     with torch.no_grad():
+    #         traj = self.sample_ode(x0=noise, N=self.num_inference_steps, vis_cond=vis_cond)
+    #         actions_norm = traj[-1]
+
+    #         actions_raw = self.normalizer['action'].unnormalize(actions_norm)
+    #         exec_start = self.n_obs_steps - 1
+    #         a0 = actions_raw[:, exec_start] if actions_raw.dim() == 3 else actions_raw
+    #         a0 = a0.clamp(-1.0, 1.0)
+
+    #         q_value = critic.q_min(state_rpt, a0).flatten()          # (N,)
+    #         idx = torch.multinomial(F.softmax(q_value, dim=0), 1)
+
+    #     return a0[idx].cpu().numpy().flatten()
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> dict:
         """obs_dict['image'] : (B, T, H, W, C)"""
@@ -196,6 +254,15 @@ class DrQv2FlowPolicy(ManiFlowStatePolicy):
         nsample = traj[-1]
 
         action_pred = self.normalizer['action'].unnormalize(nsample[..., :self.action_dim])
-        start  = To - 1
-        action = action_pred[:, start: start + self.n_action_steps]
+
+        ### Single frame action ###
+        # start  = To - 1
+        # action = action_pred[:, start: start + self.n_action_steps]
+        ### Single frame action ###
+
+
+        # start  = min(To - 1, self.horizon - 1)  # clamp: horizon=1 → start=0
+        # action = action_pred[:, start: start + self.n_action_steps]
+        action = action_pred[:, 0:1]
+
         return {'action': action, 'action_pred': action_pred}
