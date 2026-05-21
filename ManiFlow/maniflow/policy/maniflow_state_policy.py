@@ -57,8 +57,6 @@ class FlowMLP(nn.Module):
             nn.Mish(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
         )
         self.final_layer = nn.Linear(hidden_dim, action_dim)
 
@@ -72,14 +70,6 @@ class FlowMLP(nn.Module):
             (B, action_dim)
         """
         t_emb = self.time_mlp(timestep)
-        # expected_state_dim = self.mid_layer[0].in_features - sample.shape[-1] - t_emb.shape[-1]
-        # if state_cond.shape[-1] != expected_state_dim:
-        #     import traceback
-        #     traceback.print_stack()
-        #     raise RuntimeError(
-        #         f"[FlowMLP] state_cond shape {state_cond.shape} is wrong — "
-        #         f"expected last dim {expected_state_dim}, "
-        #         f"sample={sample.shape}, t_emb={t_emb.shape}")
         x = torch.cat([sample, t_emb, state_cond], dim=-1)
         x = self.mid_layer(x)
         return self.final_layer(x)
@@ -315,6 +305,7 @@ class ManiFlowStatePolicy(BasePolicy):
             lang_cond,
             critic,
             num_steps: int = 4,
+            critic_states=None,
     ):
         """DiffusionQL-style Q-loss: L_q = -Q(s, π(s)) / E|Q|"""
         batch_size = vis_cond.shape[0]
@@ -330,17 +321,23 @@ class ManiFlowStatePolicy(BasePolicy):
 
         action_raw = self.normalizer['action'].unnormalize(sampled_actions_norm)
         action_raw = action_raw.clamp(-1.0, 1.0)
-        exec_start = self.n_obs_steps - 1
-        a0 = action_raw[:, exec_start]  # (B, action_dim)
+        a0 = action_raw[:, 0]  # (B, action_dim) — horizon=1, always index 0
 
-        states = batch['obs']['full_state'][:, exec_start].to(device)  # raw, matching critic training
+        if critic_states is not None:
+            states = critic_states  # image embedding (B, obs_feature_dim)
+        else:
+            states = batch['obs']['full_state'][:, 0].to(device)  # (B, state_dim)
 
         q0, q1 = critic(states, a0)
 
-        if torch.rand(1).item() > 0.5:
-            q_loss = -q0.mean() / q1.abs().mean().detach()
-        else:
-            q_loss = -q1.mean() / q0.abs().mean().detach()
+        # if torch.rand(1).item() > 0.5:
+        #     q_loss = -q0.mean() / q1.abs().mean().detach() 
+        # else:
+        #     q_loss = -q1.mean() / q0.abs().mean().detach()
+
+        q_min = torch.min(q0, q1)
+        q_loss = -q_min.mean() / q_min.abs().mean().detach()
+
 
         with torch.no_grad():
             q_mean = torch.min(q0, q1).mean().item()
