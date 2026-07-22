@@ -220,7 +220,8 @@ class AdroitImageDataset(BaseDataset):
             data['obs']['next_full_state'] = sample['next_full_state'][n:n+1].astype(np.float32)
             data['obs']['next_state'] = sample['next_state'][n:n+1].astype(np.float32)
         if self.has_embedding:
-            data['obs']['img_embedding'] = sample['img_embedding'][n:n+1].astype(np.float32)
+            # data['obs']['img_embedding'] = sample['img_embedding'][n:n+1].astype(np.float32)
+            data['obs']['img_embedding'] = sample['img_embedding'][:n+1].astype(np.float32)
             data['obs']['next_img_embedding'] = sample['next_img_embedding'][n:n+1].astype(np.float32)
         return data
 

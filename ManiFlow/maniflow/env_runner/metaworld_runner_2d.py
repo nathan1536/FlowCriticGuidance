@@ -28,18 +28,17 @@ class MetaworldRunner2D(BaseRunner):
         eval_episodes=20,
         max_steps=1000,
         n_obs_steps=8,
-        n_action_steps=8,
+        n_action_steps=1,
         fps=10,
         crf=22,
-        render_size=84,
         tqdm_interval_sec=5.0,
         n_envs=None,
         task_name=None,
         n_train=None,
         n_test=None,
         device="cuda:0",
-        image_size: int = 128,
-        camera_name: str = "corner2",
+        image_size: int = 84,
+        camera_name: str = "gripperPOV",
     ):
         super().__init__(output_dir)
         self.task_name = task_name
@@ -100,13 +99,16 @@ class MetaworldRunner2D(BaseRunner):
                         "agent_pos": obs_dict["agent_pos"].unsqueeze(0).to(policy.device),
                         "task_name": [self.task_name],
                     }
+                    assert obs_dict_input['image'].device == policy.device, f"policy device: {policy.device}, obs device: {obs_dict_input['image'].device}"
+
                     action_dict = policy.predict_action(obs_dict_input)
 
                 np_action_dict = dict_apply(action_dict, lambda x: x.detach().to("cpu").numpy())
                 action = np_action_dict["action"].squeeze(0)
                 obs, reward, done, info = env.step(action)
 
-                traj_reward += reward
+                # traj_reward += reward
+                traj_reward = float(reward)
                 done = np.all(done)
                 # info['success'] is typically a vector over envs; keep the same logic as the 3D runner.
                 is_success = is_success or max(info["success"])

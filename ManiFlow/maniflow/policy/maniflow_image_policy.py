@@ -206,66 +206,6 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         
         return result
 
-    def predict_action_q_guided(
-            self,
-            obs_dict: Dict[str, torch.Tensor],
-            critic,
-            n_candidates: int = 10,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Q-guided action selection (DiffusionQL-style inference).
-        Samples n_candidates actions from the flow model, then selects
-        the action with probability proportional to softmax(Q).
-        """
-        nobs = self.normalizer.normalize(obs_dict)
-        value = next(iter(nobs.values()))
-        B, To = value.shape[:2]
-        T = self.horizon
-        Da = self.action_dim
-        Do = self.obs_feature_dim
-        To = self.n_obs_steps
-        device = self.device
-        dtype = self.dtype
-
-        # Encode observations
-        this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].to(device))
-        nobs_features = self.obs_encoder(this_nobs).to(device)
-        vis_cond = nobs_features.reshape(B, -1, Do)
-
-        # Repeat for n_candidates
-        vis_cond_rpt = vis_cond.repeat_interleave(n_candidates, dim=0)  # (B*n, ...)
-        cond_data_rpt = torch.zeros(B * n_candidates, T, Da, device=device, dtype=dtype)
-
-        # Sample n_candidates actions
-        nsample_rpt = self.conditional_sample(
-            cond_data_rpt, vis_cond=vis_cond_rpt, **self.kwargs)
-        naction_rpt = nsample_rpt[..., :Da]
-        action_rpt = self.normalizer['action'].unnormalize(naction_rpt)
-
-        # Get first executed action for Q evaluation
-        start = To - 1
-        end = start + self.n_action_steps
-        a0_rpt = action_rpt[:, start].clamp(-1, 1)  # (B*n, action_dim)
-
-        # Get states for critic
-        states = obs_dict['full_state'][:, start].to(device)  # (B, state_dim)
-        states_rpt = states.repeat_interleave(n_candidates, dim=0)  # (B*n, state_dim)
-
-        # Evaluate Q and select via softmax sampling
-        with torch.no_grad():
-            q_vals = critic.q_min(states_rpt, a0_rpt).squeeze(-1)  # (B*n,)
-            q_vals = q_vals.view(B, n_candidates)
-            probs = torch.softmax(q_vals, dim=1)
-            idx = torch.multinomial(probs, 1).squeeze(-1)  # (B,)
-
-        # Select best actions
-        action_rpt = action_rpt.view(B, n_candidates, T, Da)
-        selected_actions = action_rpt[torch.arange(B, device=device), idx]  # (B, T, Da)
-
-        return {
-            'action': selected_actions[:, start:end],
-            'action_pred': selected_actions,
-        }
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):

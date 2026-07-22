@@ -93,12 +93,13 @@ class AdroitRunner2D(BaseRunner):
 
                 action = np_action_dict['action'].squeeze(0)
                 obs, reward, done, info = env.step(action)
-                num_goal_achieved += np.sum(info['goal_achieved'])
+                num_goal_achieved += np.sum(info['goal_achieved'][-1])
                 episode_reward += np.sum(reward)
+
                 done = np.all(done)
                 actual_step_count += 1
 
-            all_success_rates.append(info['goal_achieved'])
+            all_success_rates.append(info['goal_achieved'][-1])
             all_goal_achieved.append(num_goal_achieved)
             all_episode_rewards.append(episode_reward)
 
@@ -109,7 +110,7 @@ class AdroitRunner2D(BaseRunner):
 
         log_data['mean_episode_reward'] = np.mean(all_episode_rewards)
         log_data['std_episode_reward'] = np.std(all_episode_rewards)
-        cprint(f"test_mean_score: {np.mean(all_success_rates)}, mean_reward: {np.mean(all_episode_rewards):.1f} ± {np.std(all_episode_rewards):.1f}", 'green')
+        cprint(f"test_mean_score: {np.mean(all_success_rates)}, num_episodes: {len(all_episode_rewards)}, mean_reward: {np.mean(all_episode_rewards):.1f} ± {np.std(all_episode_rewards):.1f}", 'green')
 
 
         self.logger_util_test.record(np.mean(all_success_rates))

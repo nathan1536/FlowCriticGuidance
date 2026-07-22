@@ -46,19 +46,23 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
                  embedding_dim: int = EMBEDDING_DIM,
                  agent_pos_dim: int = 0,
                  agent_pos_proj_dim: int = 256,
+                 n_obs_steps: int = 1,
                  **state_policy_kwargs):
-        # agent_pos projected to agent_pos_proj_dim before concat with embedding
-        obs_dim = embedding_dim + (agent_pos_proj_dim if agent_pos_dim > 0 else 0)
-        super().__init__(state_dim=obs_dim, **state_policy_kwargs)
+        # Scale obs_dim by n_obs_steps so the workspace reshape folds T frames into
+        # the feature vector (matching how ManiFlowStatePolicy handles frame stacking).
+        # per_step_dim = embedding_dim + (agent_pos_proj_dim if agent_pos_dim > 0 else 0)
+        per_step_dim = embedding_dim
+        obs_dim = n_obs_steps * per_step_dim
+        super().__init__(state_dim=obs_dim, n_obs_steps=n_obs_steps, **state_policy_kwargs)
         self.embedding_dim = embedding_dim
-        self.agent_pos_dim = agent_pos_dim
-        self.agent_pos_proj = (
-            nn.Sequential(
-                nn.Linear(agent_pos_dim, agent_pos_proj_dim // 2), nn.ReLU(),
-                nn.Linear(agent_pos_proj_dim // 2, agent_pos_proj_dim), nn.ReLU(),
-            )
-            if agent_pos_dim > 0 else None
-        )
+        # self.agent_pos_dim = agent_pos_dim
+        # self.agent_pos_proj = (
+        #     nn.Sequential(
+        #         nn.Linear(agent_pos_dim, agent_pos_proj_dim // 2), nn.ReLU(),
+        #         nn.Linear(agent_pos_proj_dim // 2, agent_pos_proj_dim), nn.ReLU(),
+        #     )
+        #     if agent_pos_dim > 0 else None
+        # )
 
         # Load frozen MCR
         MCR_DIR = str(pathlib.Path(__file__).parent.parent.parent.parent
@@ -75,11 +79,11 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
 
     def obs_encoder(self, nobs: dict) -> torch.Tensor:
         emb = nobs['img_embedding']                       # (B, T, 2048)
-        if self.agent_pos_dim > 0:
-            B, T, _ = emb.shape
-            pos = nobs['agent_pos'].to(emb.device)        # (B, T, agent_pos_dim)
-            pos = self.agent_pos_proj(pos.reshape(B * T, -1)).reshape(B, T, -1)  # (B, T, proj_dim)
-            return torch.cat([emb, pos], dim=-1)          # (B, T, 2048 + proj_dim)
+        # if self.agent_pos_dim > 0:
+        #     B, T, _ = emb.shape
+        #     pos = nobs['agent_pos'].to(emb.device)        # (B, T, agent_pos_dim)
+        #     pos = self.agent_pos_proj(pos.reshape(B * T, -1)).reshape(B, T, -1)  # (B, T, proj_dim)
+        #     return torch.cat([emb, pos], dim=-1)          # (B, T, 2048 + proj_dim)
         return emb
 
     # ── inference ─────────────────────────────────────────────────────────────
@@ -126,20 +130,22 @@ class MCRFlowPolicy(ManiFlowStatePolicy):
 
         B, T, D = embedding.shape
 
-        if self.agent_pos_dim > 0:
-            agent_pos = obs_dict['agent_pos'][:, :self.n_obs_steps].to(device)
-            agent_pos = self.normalizer['agent_pos'].normalize(agent_pos)
-            pos_proj = self.agent_pos_proj(agent_pos.reshape(B * T, -1)).reshape(B, T, -1)
-            combined = torch.cat([embedding, pos_proj], dim=-1)
-            vis_cond = combined.reshape(B, -1, self.obs_feature_dim)
-        else:
-            vis_cond = embedding.reshape(B, -1, self.obs_feature_dim)
+        # if self.agent_pos_dim > 0:
+        #     agent_pos = obs_dict['agent_pos'][:, :self.n_obs_steps].to(device)
+        #     agent_pos = self.normalizer['agent_pos'].normalize(agent_pos)
+        #     pos_proj = self.agent_pos_proj(agent_pos.reshape(B * T, -1)).reshape(B, T, -1)
+        #     combined = torch.cat([embedding, pos_proj], dim=-1)
+        #     vis_cond = combined.reshape(B, -1, self.obs_feature_dim)
+        # else:
+        #     vis_cond = embedding.reshape(B, -1, self.obs_feature_dim)
+
+        vis_cond = embedding.reshape(B, -1, self.obs_feature_dim)
 
         noise = torch.randn(B, self.horizon, self.action_dim, device=device, dtype=dtype)
         traj  = self.sample_ode(x0=noise, N=self.num_inference_steps, vis_cond=vis_cond)
         nsample = traj[-1]
 
         action_pred = self.normalizer['action'].unnormalize(nsample[..., :self.action_dim])
-        start  = self.n_obs_steps - 1
+        start  = min(self.n_obs_steps - 1, self.horizon - 1)
         action = action_pred[:, start: start + self.n_action_steps]
         return {'action': action, 'action_pred': action_pred}

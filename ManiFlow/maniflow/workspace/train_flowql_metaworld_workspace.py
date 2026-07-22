@@ -358,9 +358,10 @@ class TrainFlowQLMetaWorldWorkspace:
 
                     ql_loss_val = 0.0
                     if ql_active:
-                        ql_vis_cond = vis_cond.detach() if isinstance(self.model, DrQv2FlowPolicy) else vis_cond
+                        # _has_encoder = isinstance(self.model, DrQv2FlowPolicy) or getattr(self.model, 'is_embedding_policy', False)
+                        # ql_vis_cond = vis_cond.detach() if _has_encoder else vis_cond
                         ql_loss, ql_log = self.model.compute_flowql_loss(
-                            batch, ql_vis_cond, None, self.critic,
+                            batch, vis_cond, None, self.critic,
                             num_steps=num_sample_steps)
                         total_loss  = alpha * raw_loss + eta * ql_loss
                         loss_dict.update(ql_log)

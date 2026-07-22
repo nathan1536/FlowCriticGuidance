@@ -1,3 +1,14 @@
+import os
+
+# Restrict EGL to the NVIDIA vendor ICD before mujoco_py initializes a render
+# context. Without this, glvnd also exposes the mesa ICD, so mujoco_py enumerates
+# extra software/DRI "GPUs" and device_id=0 may land on a mesa device that fails
+# to create a DRI2 screen on newer NVIDIA GPUs -> "Failed to initialize OpenGL".
+_NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+if os.path.exists(_NVIDIA_EGL_ICD):
+    os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", _NVIDIA_EGL_ICD)
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import gym
 import numpy as np
 import metaworld
@@ -23,7 +34,7 @@ class MetaWorldEnv2D(gym.Env):
         task_name: str,
         device: str = "cuda:0",
         image_size: int = 128,
-        camera_name: str = "corner2",
+        camera_name: str = "gripperPOV",
     ):
         super().__init__()
 
@@ -40,12 +51,12 @@ class MetaWorldEnv2D(gym.Env):
             self.env._freeze_rand_vec = False
 
         # Match the 3D wrapper's camera defaults (best effort).
-        try:
-            self.env.sim.model.cam_pos[2] = [0.6, 0.295, 0.8]
-            self.env.sim.model.vis.map.znear = 0.1
-            self.env.sim.model.vis.map.zfar = 1.5
-        except Exception:
-            pass
+        # try:
+        #     self.env.sim.model.cam_pos[2] = [0.6, 0.295, 0.8]
+        #     self.env.sim.model.vis.map.znear = 0.1
+        #     self.env.sim.model.vis.map.zfar = 1.5
+        # except Exception:
+        #     pass
 
         # Render device selection (MuJoCo device_id)
         # Accept "cuda:0" or ["cuda:0", ...] / "['cuda:0', ...]" and pick the first.

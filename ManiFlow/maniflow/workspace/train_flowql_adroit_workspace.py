@@ -325,7 +325,11 @@ class TrainFlowQLAdroitWorkspace:
                             #     # State-based policy (D4RL, MetaWorld state, Adroit state)
                             #     next_obs_dict['full_state'] = batch['obs']['next_full_state'][:, :self.model.n_obs_steps]
                             if getattr(self.model, 'is_embedding_policy', False):
-                                next_obs_dict['img_embedding'] = batch['obs']['next_img_embedding'][:, :self.model.n_obs_steps]
+                                # next_obs_dict['img_embedding'] = batch['obs']['next_img_embedding'][:, :self.model.n_obs_steps]
+                                next_obs_dict['img_embedding'] = torch.cat([
+                                    batch['obs']['img_embedding'][:, 1:],           # (B, T-1, 2048)
+                                    batch['obs']['next_img_embedding'][:, :1],       # (B, 1,   2048)
+                                ], dim=1)  # (B, T, 2048)
                             elif getattr(self.model, 'is_image_policy', False):
                                 # Slide the obs window: drop oldest frame, append next_img
                                 # current: [t-2, t-1, t], next stack: [t-1, t, t+1]
@@ -338,7 +342,10 @@ class TrainFlowQLAdroitWorkspace:
                                 
                             next_nobs = self.model.normalizer.normalize(next_obs_dict)
                             next_nobs = dict_apply(next_nobs, lambda x: x.to(device))
-                            next_vis_cond = self.model.obs_encoder(next_nobs)
+                            # next_vis_cond = self.model.obs_encoder(next_nobs)
+                            ### Change to ema policy to stable ql###
+                            next_vis_cond = ema_policy.obs_encoder(next_nobs)
+                            ### Change to ema policy to stable ql ###
                             next_vis_cond = next_vis_cond.reshape(batch_size, -1, self.model.obs_feature_dim)
 
                             noise = torch.randn(
@@ -376,8 +383,9 @@ class TrainFlowQLAdroitWorkspace:
 
                         self.critic_optimizer.zero_grad()
                         critic_loss.backward()
-                        if grad_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=grad_norm)
+                        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.critic.parameters(),
+                            max_norm=grad_norm if grad_norm > 0 else float('inf'))
                         self.critic_optimizer.step()
                         if critic_lr_scheduler is not None:
                             critic_lr_scheduler.step()
@@ -420,10 +428,9 @@ class TrainFlowQLAdroitWorkspace:
 
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
                         _policy_grad_norm = cfg.training.get("max_grad_norm", 1.0)
-                        if _policy_grad_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                max_norm=_policy_grad_norm)
+                        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=_policy_grad_norm if _policy_grad_norm > 0 else float('inf'))
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
@@ -451,6 +458,8 @@ class TrainFlowQLAdroitWorkspace:
                         'target_q_mean': target_q_mean,
                         'ql_loss': ql_loss_val,
                         'ql_active': 1.0 if ql_active else 0.0,
+                        'critic_grad_norm': critic_grad_norm.item() if ql_active else 0.0,
+                        'policy_grad_norm': policy_grad_norm.item(),
                     }
                     step_log.update(loss_dict)
 

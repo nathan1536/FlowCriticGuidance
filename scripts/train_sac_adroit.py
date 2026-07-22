@@ -20,6 +20,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# Restrict EGL to the NVIDIA vendor ICD before mujoco_py initializes a render
+# context. Without this, glvnd also exposes the mesa ICD, so mujoco_py enumerates
+# extra software/DRI "GPUs" and device_id=0 may land on a mesa device that fails
+# to create a DRI2 screen on newer NVIDIA GPUs -> "Failed to initialize OpenGL".
+_NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+if os.path.exists(_NVIDIA_EGL_ICD):
+    os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", _NVIDIA_EGL_ICD)
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 
 def _save_sac_twin_critic(model, save_path: Path) -> None:
     """

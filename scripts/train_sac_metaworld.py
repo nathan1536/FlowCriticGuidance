@@ -264,7 +264,7 @@ def parse_args():
     # ── Environment / general ──
     p.add_argument("--task", type=str, default="reach",
                    help="MetaWorld task name (e.g., reach, pick-place, coffee-pull, ...)")
-    p.add_argument("--total-timesteps", type=int, default=10_000_000)
+    p.add_argument("--total-timesteps", type=int, default=20_000_000)
     p.add_argument("--n-envs", type=int, default=16,
                    help="Number of parallel envs (SAC supports multi-env with step-based training)")
     p.add_argument("--seed", type=int, default=1)
